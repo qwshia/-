@@ -1,0 +1,6 @@
+# 项目虚拟环境 .venv 内使用（langgraph 1.x + langchain-core 1.x）
+langgraph==1.2.16
+langchain-core==1.6.12
+langchain-openai==1.7.2
+langgraph-checkpoint-sqlite==3.1.2
+python-dotenv
