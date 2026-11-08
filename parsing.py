@@ -8,13 +8,9 @@ _ATTIRE_PUT_ON = [
     re.compile(r"(?:穿上|穿起来|穿戴|套上|披上|戴上)\s*([\u4e00-\u9fa5A-Za-z0-9（）()]{1,12})"),
 ]
 _ATTIRE_TAKE_OFF = [
-    re.compile(r"(?:把|将)?\s*([\u4e00-\u9fa5A-Za-z0-9（）()]{1,12})\s*(?:脱掉|脱下|拿下|卸下|除下)"),
-    re.compile(r"(?:脱掉|脱下|拿下|卸下|除下)\s*([\u4e00-\u9fa5A-Za-z0-9（）()]{1,12})"),
+    re.compile(r"(?:把|将)?\s*([\u4e00-\u9fa5A-Za-z0-9（）()]{1,12})\s*(?:脱掉|脱下|拿下|卸下|除下|脱了)"),
+    re.compile(r"(?:脱掉|脱下|拿下|卸下|除下|脱了)\s*([\u4e00-\u9fa5A-Za-z0-9（）()]{1,12})"),
     re.compile(r"(?:脱光光|脱光|全脱|全部脱掉|脱个精光)"),
-]
-
-_PLAYER_ATTIRE_PAT = [
-    re.compile(r"(?:我|玩家).{0,4}(?:把|将)?\s*([\u4e00-\u9fa5A-Za-z0-9（）()]{1,12})\s*(?:脱掉|脱下|穿上|穿起)"),
 ]
 
 _ITEM_REQ_PAT = [
@@ -27,9 +23,15 @@ _MOVE_PAT = [
 ]
 
 
+_CONJUNCTIONS = ("和", "与", "跟", "及", "、")
+
 def _parse_attire_change(msg: str):
+    if any(c in (msg or "") for c in _CONJUNCTIONS):
+        return None
     # 脱光
     if re.search(r"脱光光|脱光|全脱|全部脱掉|脱个精光", msg):
+        return "take_off", "全部"
+    if "全" in (msg or "") and re.search(r"脱", msg or ""):
         return "take_off", "全部"
     for pat in _ATTIRE_PUT_ON:
         m = pat.search(msg)
@@ -49,18 +51,9 @@ def _parse_attire_change(msg: str):
     return None
 
 
-def _parse_player_attire(msg: str):
-    for pat in _PLAYER_ATTIRE_PAT:
-        m = pat.search(msg)
-        if m:
-            item = m.group(1).strip(_ATTIRE_STRIP)
-            if item:
-                act = "take_off" if re.search(r"脱", msg) else "put_on"
-                return act, item
-    return None
-
-
 def _parse_item_request(msg: str, props: list, holder_name: str) -> str | None:
+    if any(c in (msg or "") for c in ("和", "与", "跟")):
+        return None
     # 优先：props 中该 NPC 持有的物品名直接出现在 msg 中
     for p in props:
         if p.get("holder") == holder_name and p.get("name") and p.get("name") in msg:
@@ -91,17 +84,66 @@ def _parse_npc_move(msg: str, avail: list) -> str | None:
     return None
 
 
-def _apply_attire(cur: str, action: str, item: str) -> str:
-    item = item.strip(_ATTIRE_STRIP)
+_ATTIRE_PREFIXES = ("外罩", "内穿", "身着", "穿着", "足蹬", "头戴", "手持", "披着", "套着", "外披", "内衬")
+
+
+def _strip_attire_affixes(s: str) -> str:
+    s = s or ""
+    for w in _ATTIRE_PREFIXES:
+        s = s.replace(w, "")
+    return s.strip(_ATTIRE_STRIP)
+
+
+def _apply_attire(cur, action: str, item) -> dict:
+    if not isinstance(cur, dict):
+        if isinstance(cur, str):
+            cur = {"全装": cur.strip()} if cur.strip() and cur.strip() not in ("", "无") else {}
+        else:
+            cur = {}
+    cur = dict(cur)
+    if isinstance(item, (list, tuple)):
+        items = [str(x) for x in item]
+    else:
+        items = [item]
+
     if action == "take_off":
-        if item in ("衣服", "衣", "全部", "所有", "全身", "全部衣服"):
-            return ""
-        parts = [s for s in re.split(r"[，,、;；]", cur) if item not in s]
-        res = "，".join(parts).strip("，,、;； ")
-        return res
-    if item in cur:
+        for it in items:
+            it_s = (it or "").strip() if isinstance(it, str) else str(it).strip()
+            it_core = _strip_attire_affixes(it_s) or it_s
+            if any(k in it_s for k in ("全部", "所有", "衣服")) or it_core in ("衣服", "衣", "全部", "所有", "全身", "全部衣服"):
+                return {}
+        for key in list(cur.keys()):
+            val = str(cur.get(key, "") or "")
+            val_core = _strip_attire_affixes(val) or val
+            for it in items:
+                it_s = (it or "").strip() if isinstance(it, str) else str(it).strip()
+                it_core = _strip_attire_affixes(it_s) or it_s
+                matched = False
+                if it_s and (it_s in val or val in it_s or it_s in key or key in it_s
+                             or it_core in val_core or val_core in it_core):
+                    matched = True
+                # 长句包含：value（或其核心词）出现在长句中
+                if not matched:
+                    # 滑动窗口：val_core 中任意长度>=2 的子串出现在 it_s 中
+                    for L in range(min(len(val_core), 4), 1, -1):
+                        for i in range(len(val_core) - L + 1):
+                            sub = val_core[i:i+L]
+                            if sub and sub in it_s:
+                                matched = True
+                                break
+                        if matched:
+                            break
+                if matched:
+                    del cur[key]
+                    break
         return cur
-    return (cur + "，" + item) if cur else item
+
+    # put_on
+    for it in items:
+        it_s = (it or "").strip() if isinstance(it, str) else str(it).strip()
+        if it_s and it_s not in [str(v) for v in cur.values()]:
+            cur["外衣"] = it_s
+    return cur
 
 
 _NPC_CMD_PREFIX = re.compile(r"^\s*[!！]\s*@(?:子|npc_)?\d+\s*")
@@ -115,4 +157,3 @@ def _is_npc_command(msg: str) -> bool:
 def _strip_npc_cmd_prefix(msg: str) -> str:
     """剥掉 !令 @N 前缀，返回剩余内容（给 _parse_* 识别与 prompt 用）。"""
     return _NPC_CMD_PREFIX.sub("", msg or "", count=1).strip()
-

@@ -21,6 +21,7 @@ WORLD_MODEL = os.getenv("WORLD_MODEL", "qwen3.8-max-0902")
 JUDGE_MODEL = os.getenv("JUDGE_MODEL", "deepseek-v4.1-flash")
 ACTOR_MODEL = os.getenv("ACTOR_MODEL", "qwen3.8-omni-flash")
 MEMORY_MODEL = os.getenv("MEMORY_MODEL", "qwen3.8-27b")
+INTENT_MODEL = os.getenv("INTENT_MODEL", "qwen3.8-flash")
 
 # 全局强制关闭深度思考
 def _thinking_extra(model, base_url):
@@ -59,5 +60,13 @@ memory_llm = ChatOpenAI(
     model=MEMORY_MODEL, api_key=LLM_API_KEY, base_url=LLM_BASE_URL,
     temperature=0.3, timeout=60, max_retries=0,
     extra_body=_thinking_extra(MEMORY_MODEL, LLM_BASE_URL),
+    stream_usage=True,
+)
+
+# 5. 意图识别（极速模型，极低温度，保证分类客观）
+intent_llm = ChatOpenAI(
+    model=INTENT_MODEL, api_key=LLM_API_KEY, base_url=LLM_BASE_URL,
+    temperature=0.1, timeout=60, max_retries=0,
+    extra_body=_thinking_extra(INTENT_MODEL, LLM_BASE_URL),
     stream_usage=True,
 )

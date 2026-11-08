@@ -9,6 +9,7 @@ from langchain_core.messages import HumanMessage
 
 from config import actor_llm
 from state import AgentState
+from utils import _get_item_names
 
 
 async def hint_node(state: AgentState) -> dict:
@@ -17,7 +18,7 @@ async def hint_node(state: AgentState) -> dict:
     npcs = state.get("npcs") or {}
     scenes = state.get("scenes") or {}
     props = state.get("props") or []
-    items = state.get("player_items") or []
+    items = _get_item_names(state.get("player_items") or [])
     clues = state.get("player_revealed_clues") or []
     ending_goal = state.get("ending_goal", "")
     global_truth = state.get("global_truth", "")

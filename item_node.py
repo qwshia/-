@@ -1,11 +1,14 @@
 """道具状态机节点：item_node —— 确定性处理物品给予/开箱/偷窃。"""
+import copy
+import json
 import re
 
 from config import actor_llm
 from langchain_core.messages import HumanMessage
 from state import AgentState
-from utils import _parse_content
+from utils import _parse_content, _resolve_sub_desc
 from item_utils import can_acquire, split_keys, player_has_key, key_name_of, key_owner_npc
+from utils import _get_item_names, _upsert_item
 
 _STEAL_RE = re.compile(r"(?:偷|窃取|顺走|拿走)(?:\s*([\u4e00-\u9fa5A-Za-z0-9（）()]{1,12}))?")
 
@@ -15,12 +18,13 @@ def is_steal_cmd(msg: str) -> bool:
 async def item_node(state: AgentState) -> dict:
     transfers = state.get("item_transfers") or []
     scene = state.get("current_scene", "")
-    player_items = list(state.get("player_items") or [])
+    player_items = copy.deepcopy(state.get("player_items") or [])
     props = [dict(p) for p in (state.get("props") or [])]
     desc_map = dict(state.get("item_desc_map") or {})
     done = list(state.get("processed_transfers") or [])
     events = []
     sys_msgs = []
+    ui_events = []
 
     def _land(name, tp, mode):
         parsed = _parse_content(tp.get("content"))
@@ -41,57 +45,107 @@ async def item_node(state: AgentState) -> dict:
                     sys_msgs.append("这东西被生物锁保护，你拿不走。")
                     return
             if locked and mode != "auto_open":
-                if name not in player_items:
-                    player_items.append(name)
+                _upsert_item(player_items, name, count=1)
                 desc_map[name] = f"{desc}（锁着，需要{key_name_of(tp)}）"
-                desc_map[f"__content__:{name}"] = ",".join(got_names)
+                desc_map[f"__content__:{name}"] = json.dumps(parsed, ensure_ascii=False)
+                for _c in parsed:
+                    _cn = _c.get("name") if isinstance(_c, dict) else str(_c)
+                    _cn = str(_cn or "").strip()
+                    if not _cn:
+                        continue
+                    _rd = _resolve_sub_desc(_cn, name, props, scenes, desc_map)
+                    if _rd:
+                        desc_map[_cn] = _rd
+                    else:
+                        # remove placeholder completely
+                        _ph = desc_map.get(_cn, "")
+                        if isinstance(_ph, str) and "内部" in _ph:
+                            desc_map.pop(_cn, None)
+                        for _it in player_items:
+                            if isinstance(_it, dict) and str(_it.get("name", "")).strip() == _cn:
+                                _d0 = str(_it.get("desc", "") or "")
+                                if "内部" in _d0:
+                                    _it["desc"] = ""
                 props[:] = [p for p in props if p.get("name") != name]
+                for _c in parsed:
+                    _cn = _c.get("name") if isinstance(_c, dict) else _c
+                    for _pp in props:
+                        if _pp.get("name") == _cn:
+                            _pp.pop("container", None)
                 if mode == "transfer":
                     events.append(f"{name}到了玩家手中")
+                ui_events.append({"type": "item_acquired", "item": name})
+                if mode in ("transfer", "auto_open"):
+                    ui_events.append({"type": "item_transfer", "item": name, "count": int((tp or {}).get("count", 1) or 1), "from_npc": str((tp or {}).get("holder", "") or ""), "to_player": True})  # 2D frontend
                 return
 
             # 如果是 auto_open，或者是无锁，都会走到这里，直接展开
-            if name not in player_items:
-                player_items.append(name)
+            _upsert_item(player_items, name, count=1)
             desc_map[name] = f"{desc}（已开启）"
             for c in parsed:
-                cn = c["name"]
-                if cn not in player_items:
-                    player_items.append(cn)
+                cn = c.get("name") if isinstance(c, dict) else str(c)
+                cn = str(cn or "").strip()
+                if not cn:
+                    continue
+                if cn not in _get_item_names(player_items):
+                    _upsert_item(player_items, cn, count=1)
+                _cur_desc = str(desc_map.get(cn, "") or "")
+                if (not _cur_desc) or (_cur_desc.startswith("在") and "内部" in _cur_desc):
+                    _real = ""
+                    if isinstance(c, dict):
+                        _t = str(c.get("text", "") or "").strip()
+                        if _t and "内部" not in _t:
+                            _real = _t
+                    if not _real:
+                        _real = _resolve_sub_desc(cn, name, props, scenes, desc_map)
+                    if not _real:
+                        _subp = next((pp for pp in props if pp.get("name") == cn), None)
+                        if _subp and _subp.get("desc"):
+                            _d = str(_subp.get("desc")).strip()
+                            if "内部" not in _d:
+                                _real = _d
+                    if not _real and isinstance(c, dict) and c.get("desc"):
+                        _d = str(c.get("desc")).strip()
+                        if "内部" not in _d:
+                            _real = _d
+                    if _real:
+                        desc_map[cn] = _real
+                        for _it in player_items:
+                            if isinstance(_it, dict) and str(_it.get("name", "")).strip() == cn:
+                                _it["desc"] = _real
+                    else:
+                        if _cur_desc.startswith("在") and "内部" in _cur_desc:
+                            desc_map.pop(cn, None)
                 if cn not in desc_map:
                     desc_map[cn] = ""
-                if c.get("text"):
-                    desc_map[cn] = (desc_map.get(cn, "") + "；" + c["text"]).strip("；")
+                if isinstance(c, dict) and c.get("text"):
+                    _txt = str(c.get("text")).strip()
+                    if _txt and "内部" not in _txt:
+                        desc_map[cn] = (str(desc_map.get(cn, "") or "") + "；" + _txt).strip("；")
+                for _pp in props:
+                    if _pp.get("name") == cn:
+                        _pp.pop("container", None)
             props[:] = [p for p in props if p.get("name") != name]
             if mode in ("transfer", "auto_open"):
                 events.append(f"{name}到了玩家手中")
-            return
-            # 无锁
-            if name not in player_items:
-                player_items.append(name)
-            desc_map[name] = f"{desc}（已开启）"
-            for c in parsed:
-                cn = c["name"]
-                if cn not in player_items:
-                    player_items.append(cn)
-                if cn not in desc_map:
-                    desc_map[cn] = ""
-                if c.get("text"):
-                    desc_map[cn] = (desc_map.get(cn, "") + "；" + c["text"]).strip("；")
-            props[:] = [p for p in props if p.get("name") != name]
-            if mode == "transfer":
-                events.append(f"{name}到了玩家手中")
+            ui_events.append({"type": "item_acquired", "item": name})
+            ui_events.append({"type": "container_opened", "container": name, "revealed_items": [c.get("name") if isinstance(c, dict) else str(c) for c in parsed]})  # 2D frontend
+            if mode in ("transfer", "auto_open"):
+                ui_events.append({"type": "item_transfer", "item": name, "count": int((tp or {}).get("count", 1) or 1), "from_npc": str((tp or {}).get("holder", "") or ""), "to_player": True})  # 2D frontend
             return
         # 无 content
-        if name not in player_items:
-            player_items.append(name)
+        _upsert_item(player_items, name, count=1)
         desc_map[name] = desc
         props[:] = [p for p in props if p.get("name") != name]
         if mode == "transfer":
             events.append(f"{name}到了玩家手中")
+        ui_events.append({"type": "item_acquired", "item": name})
+        if mode in ("transfer", "auto_open"):
+            ui_events.append({"type": "item_transfer", "item": name, "count": int((tp or {}).get("count", 1) or 1), "from_npc": str((tp or {}).get("holder", "") or ""), "to_player": True})  # 2D frontend
         return
 
     avail = set(state.get("available_scenes") or [])
+    scenes = state.get("scenes") or {}
     for tr in transfers:
         name = tr.get("item")
         sig = f"{tr.get('from')}::{name}"
@@ -162,6 +216,8 @@ async def item_node(state: AgentState) -> dict:
                     "processed_transfers": done,
                     "steal_attempts": steal_attempts,
                 }
+                if ui_events:
+                    out["ui_events"] = ui_events
                 if sys_msgs:
                     out["history"] = [{"speaker": "system", "content": "【系统】" + "\n".join(sys_msgs)}]
                 return out
@@ -177,6 +233,8 @@ async def item_node(state: AgentState) -> dict:
                 "processed_transfers": done,
                 "steal_attempts": steal_attempts,
             }
+            if ui_events:
+                out["ui_events"] = ui_events
             if sys_msgs:
                 out["history"] = [{"speaker": "system", "content": "【系统】" + "\n".join(sys_msgs)}]
             return out
@@ -186,6 +244,7 @@ async def item_node(state: AgentState) -> dict:
             if holder_npc:
                 npcs_patch = {holder_npc: {"affection": max(-100, int(holder_info.get("affection", 50)) - penalty)}}
             sys_msgs.append(f"【系统】偷窃「{steal_target}」失败，{holder}似乎有所察觉。")
+            ui_events.append({"type": "action_feedback", "target": holder, "action": "steal_failed", "shake_screen": True})  # 2D frontend
             events_out = [f"玩家偷窃{steal_target}失败，{holder}产生警觉"]
             try:
                 r = await actor_llm.ainvoke([HumanMessage(content=f"你是{holder}，性格{holder_info.get('personality','')}，对玩家好感度{aff}。玩家试图偷你的{steal_target}但失败了，用一句话反应（40字内），好感低时更愤怒。")])
@@ -199,6 +258,7 @@ async def item_node(state: AgentState) -> dict:
                 "processed_transfers": done,
                 "steal_attempts": steal_attempts,
                 "npcs": npcs_patch,
+                "ui_events": ui_events,
                 "history": [
                     {"speaker": "user", "content": msg},
                     {"speaker": holder_npc or "system", "content": npc_reply},
@@ -218,6 +278,8 @@ async def item_node(state: AgentState) -> dict:
     }
     if events:
         out["world_events"] = events
+    if ui_events:
+        out["ui_events"] = ui_events
     if sys_msgs:
         out["history"] = [{"speaker": "system", "content": m} for m in sys_msgs]
     return out

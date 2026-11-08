@@ -71,6 +71,7 @@ def fan_out(state: AgentState):
         "props": state.get("props", []),
         "scenes": state.get("scenes", {}),
         "player_attire": state.get("player_attire", "普通衣着"),
+        "player_intent": state.get("player_intent") or {},
         "player_name": state.get("player_name", ""),
         "item_desc_map": state.get("item_desc_map", {}),
         "p2p_transcript": state.get("p2p_transcript", ""),

@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 checkpoints.db
 checkpoints.db-*
+chroma_game_memory/

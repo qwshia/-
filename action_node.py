@@ -1,13 +1,12 @@
 """动作引擎节点：action_engine —— 指令集 !去 / 调查 / 开锁。"""
+import copy
+import json
 import re
 
 from state import AgentState
-from utils import _parse_content
+from utils import _parse_content, _resolve_sub_desc
 from item_utils import can_acquire, split_keys, player_has_key, key_name_of, key_owner_npc
-
-
-def _sys(*parts: str) -> dict:
-    return {"history": [{"speaker": "system", "content": f"【系统】{' '.join(parts)}"}]}
+from utils import _get_item_names, _upsert_item, handle_container_open
 
 
 def _need_keys(scene_def: dict) -> list:
@@ -37,9 +36,10 @@ async def action_engine(state: AgentState) -> dict:
     msg = state.get("user_msg", "")
     scene = state.get("current_scene", "未知")
     scenes = state.get("scenes") or {}
-    items = list(state.get("player_items") or [])
+    items = copy.deepcopy(state.get("player_items") or [])
     sys_replies = []
-    new_items = list(items)
+    ui_events = []  # 2D frontend UI events
+    new_items = copy.deepcopy(items)
     new_scene = scene
     avail = state.get("available_scenes", [])
     opened = list(state.get("opened_scenes") or [])
@@ -70,9 +70,9 @@ async def action_engine(state: AgentState) -> dict:
                 new_scene = hit
                 if hit not in opened and need:
                     opened.append(hit)
-                desc = scenes.get(hit, {}).get("desc", "")
+                ui_events.append({"type": "scene_transition", "from_scene": scene, "to_scene": hit, "motion": "walk"})  # 2D frontend
                 prefix = "门已打开，" if hit in opened else "你推开门，"
-                sys_replies.append(f"{prefix}来到了 {hit}。" + (f"\n{desc}" if desc else ""))
+                sys_replies.append(f"{prefix}来到了 {hit}。")
         else:
             sys_replies.append(f"这里没有叫 {target} 的地方。可去：{'、'.join(avail) or '（无）'}")
 
@@ -90,11 +90,12 @@ async def action_engine(state: AgentState) -> dict:
                     "props": props,
                     "item_desc_map": desc_map,
                     "opened_scenes": opened,
+                    "ui_events": ui_events,
                     "history": [{"speaker": "system", "content": f"【系统】{' '.join(sys_replies)}"}],
                 }
             
             # 背包物品直接调查（不依赖场景/ props 候选）
-            if loc in new_items:
+            if loc in _get_item_names(new_items):
                 _d = str(desc_map.get(loc, "") or "")
                 if "（锁着，需要" in _d:
                     _m = re.search(r"（锁着，需要(.+?)）", _d)
@@ -103,15 +104,9 @@ async def action_engine(state: AgentState) -> dict:
                     if _missing:
                         sys_replies.append(f"「{loc}」还缺{'、'.join(_missing)}才能打开。")
                     else:
-                        _subs = [x.strip() for x in str(desc_map.get(f"__content__:{loc}", "")).split(",") if x.strip()]
-                        for _s in _subs:
-                            if _s not in new_items:
-                                new_items.append(_s)
-                        _base = _d.split("（锁着")[0].strip()
-                        desc_map[loc] = f"{_base}（已开启）"
-                        desc_map.pop(f"__content__:{loc}", None)
-                        desc_map.pop(f"__agreed__:{loc}", None)
-                        sys_replies.append(f"你打开了「{loc}」，里面是：{'、'.join(_subs) or '（空）'}。")
+                        _subs = handle_container_open(loc, desc_map, props, new_items, scenes)
+                        ui_events.append({"type": "container_opened", "container": loc, "revealed_items": list(_subs)})  # 2D frontend
+                        sys_replies.append(f"你打开了「{loc}」，子物品是：{'、'.join(_subs) or '（空）'}。")
                 elif f"__agreed__:{loc}" in desc_map:
                     _m = re.search(r"还缺(.+?)(?:）|$)", _d)
                     _rem = _m.group(1) if _m else ""
@@ -120,15 +115,9 @@ async def action_engine(state: AgentState) -> dict:
                     if _missing:
                         sys_replies.append(f"「{loc}」还缺{'、'.join(_missing)}才能打开。")
                     else:
-                        _subs = [x.strip() for x in str(desc_map.get(f"__content__:{loc}", "")).split(",") if x.strip()]
-                        for _s in _subs:
-                            if _s not in new_items:
-                                new_items.append(_s)
-                        _base = _d.split("（锁着")[0].strip()
-                        desc_map[loc] = f"{_base}（已开启）"
-                        desc_map.pop(f"__content__:{loc}", None)
-                        desc_map.pop(f"__agreed__:{loc}", None)
-                        sys_replies.append(f"你打开了「{loc}」，里面是：{'、'.join(_subs) or '（空）'}。")
+                        _subs = handle_container_open(loc, desc_map, props, new_items, scenes)
+                        ui_events.append({"type": "container_opened", "container": loc, "revealed_items": list(_subs)})  # 2D frontend
+                        sys_replies.append(f"你打开了「{loc}」，子物品是：{'、'.join(_subs) or '（空）'}。")
                 else:
                     sys_replies.append(f"「{loc}」：{_d or '用途不明'}")
                 return {
@@ -137,23 +126,21 @@ async def action_engine(state: AgentState) -> dict:
                     "props": props,
                     "item_desc_map": desc_map,
                     "opened_scenes": opened,
+                    "ui_events": ui_events,
                     "history": [{"speaker": "system", "content": f"【系统】{' '.join(sys_replies)}"}],
                 }
                 
             hit = loc if loc in avail else None
             if hit:
                 if hit != scene:
-                    _rk = _need_keys(scenes.get(hit, {}))
-                    if hit in opened:
-                        _rk = []
-                    _tip = f"（需要：{'、'.join(_rk)}）" if _rk else ""
-                    sys_replies.append(f"你不在 {hit}，没法调查那里。去其他场景请用「去 {hit}」{_tip}。")
+                    sys_replies.append(f"你不在 {hit}，没法调查那里。去其他场景请用「去 {hit}」。")
                     return {
                         "current_scene": new_scene,
                         "player_items": new_items,
                         "props": props,
                         "item_desc_map": desc_map,
                         "opened_scenes": opened,
+                        "ui_events": ui_events,
                         "history": [{"speaker": "system", "content": f"【系统】{' '.join(sys_replies)}"}],
                     }
                 loc = ""  # 当前场景名 → 全量调查
@@ -169,10 +156,10 @@ async def action_engine(state: AgentState) -> dict:
             if not (isinstance(p, dict) and p.get("name")):
                 continue
             # 强制修复随身物品的 location 漂移
-            if p.get("carried") and p.get("holder"):
+            if p.get("carried") and p.get("holder") and p.get("holder") not in ("玩家", "玩家身上"):
                 _owner_scene = next((info.get("location") for info in npcs.values() if info.get("name") == p.get("holder")), "")
-                if _owner_scene == scene:
-                    p["location"] = scene 
+                if _owner_scene:
+                    p["location"] = _owner_scene
             
             if p.get("content"):
                 if _loc_match(p.get("location"), scene) or p.get("holder") == "玩家":
@@ -195,7 +182,7 @@ async def action_engine(state: AgentState) -> dict:
                     if key_owner_npc(it.get("name", ""), props) and not it.get("content") and not it.get("locked"):
                         continue
                     it_name = it["name"]
-                    if it_name in new_items:
+                    if it_name in _get_item_names(new_items):
                         continue
                     desc = str(it.get("desc", "") or "").strip()
                     desc_txt = desc.rstrip("。. ")
@@ -208,8 +195,7 @@ async def action_engine(state: AgentState) -> dict:
                     status, detail = can_acquire(it, npcs, new_items, props, scene)
                     
                     if status == "free":
-                        if it_name not in new_items:
-                            new_items.append(it_name)
+                        _upsert_item(new_items, it_name, count=1)
                         if not is_prop:
                             _si = (scenes.get(scene) or {}).get("items", [])
                             if isinstance(_si, list):
@@ -228,17 +214,25 @@ async def action_engine(state: AgentState) -> dict:
                                 if ("：" in _cname or ":" in _cname) and len(_cname) > 10 and not _ctext:
                                     _ctext = _cname
                                     _cname = f"{it_name}内容"
-                                if _cname not in new_items:
-                                    new_items.append(_cname)
+                                if _cname not in _get_item_names(new_items):
+                                    _upsert_item(new_items, _cname, count=1)
                                 _full_desc = _ctext if _ctext else desc_map.get(_cname, "")
                                 if _full_desc:
                                     desc_map[_cname] = _full_desc
+                                _cur_desc = str(desc_map.get(_cname, "") or "")
+                                if (not _cur_desc) or (_cur_desc.startswith("在") and "内部" in _cur_desc):
+                                    _sp = next((pp for pp in props if pp.get("name") == _cname), None)
+                                    if _sp and _sp.get("desc"):
+                                        desc_map[_cname] = str(_sp.get("desc")).strip()
+                                for _pp in props:
+                                    if _pp.get("name") == _cname:
+                                        _pp.pop("container", None)
                             desc_map[it_name] = f"{_desc_out}（已开启）"
                             _sub_names = [c.get("name", "") for c in parsed_content]
                             _holder = it.get("holder", "")
                             _is_npc_item = _holder and _holder not in ("玩家", "玩家身上", "")
                             if _is_npc_item:
-                                sys_replies.append(f"你拿走了「{it_name}」（这是{_holder}的东西），里面是：{'、'.join(_sub_names)}。")
+                                sys_replies.append(f"你拿走了「{it_name}」，这是{_holder}的东西，里面是：{'、'.join(_sub_names)}。")
                             else:
                                 sys_replies.append(f"你拿走了「{it_name}」，里面是：{'、'.join(_sub_names)}。")
                         else:
@@ -246,7 +240,7 @@ async def action_engine(state: AgentState) -> dict:
                             _holder = it.get("holder", "")
                             _is_npc_item = _holder and _holder not in ("玩家", "玩家身上", "")
                             if _is_npc_item:
-                                sys_replies.append(f"你拿走了「{it_name}」（这是{_holder}的东西）。")
+                                sys_replies.append(f"你拿走了「{it_name}」，这是{_holder}的东西。")
                             else:
                                 sys_replies.append(f"你拿走了「{it_name}」。")
                         
@@ -273,27 +267,45 @@ async def action_engine(state: AgentState) -> dict:
                             sys_replies.append(f"「{it_name}」需要{owner}的凭证锁，需{owner}本人同意才能打开（用 !@N 给我 {it_name}）")
                             found_any = True
                         else:
-                            new_items.append(it_name)
+                            _upsert_item(new_items, it_name, count=1)
                             if not is_prop:
                                 _si = (scenes.get(scene) or {}).get("items", [])
                                 if isinstance(_si, list):
                                     scenes[scene]["items"] = [x for x in _si if not (isinstance(x, dict) and x.get("name") == it_name)]
                             desc_map[it_name] = f"{desc}（锁着，需要{detail}）"
-                            sub_names = [c["name"] for c in parsed_content]
-                            desc_map[f"__content__:{it_name}"] = ",".join(sub_names)
+                            desc_map[f"__content__:{it_name}"] = json.dumps(parsed_content, ensure_ascii=False)
+                            for _c in (parsed_content or []):
+                                _cn = _c.get("name") if isinstance(_c, dict) else str(_c)
+                                _cn = str(_cn or "").strip()
+                                if not _cn:
+                                    continue
+                                _rd = _resolve_sub_desc(_cn, it_name, props, scenes, desc_map)
+                                if _rd:
+                                    desc_map[_cn] = _rd
+                                else:
+                                    _ph = desc_map.get(_cn, "")
+                                    if isinstance(_ph, str) and "内部" in _ph:
+                                        desc_map.pop(_cn, None)
+                                    for _it in new_items:
+                                        if isinstance(_it, dict) and str(_it.get("name", "")).strip() == _cn:
+                                            _d0 = str(_it.get("desc", "") or "")
+                                            if "内部" in _d0:
+                                                _it["desc"] = ""
                             sys_replies.append(f"你发现了「{it_name}」：{desc_txt}。它锁着，还缺{detail}才能打开。")
                             found_any = True
                             
                     elif status == "npc_present":
                         if it.get("carried"):
-                            sys_replies.append(f"「{it_name}」在{detail}身上（随身携带），你需要向TA索要（!@N 给物）或偷取（!偷）。")
+                            sys_replies.append(f"「{it_name}」在{detail}身上（随身携带），需要向 TA 索要或偷取。")
                         else:
-                            sys_replies.append(f"「{it_name}」被{detail}盯着，需先支开TA，或走 !@N 给物 / !偷。")
+                            sys_replies.append(f"「{it_name}」在{detail}身上，需先支开他，或尝试偷取。")
                         found_any = True
                     elif status == "unknown":
                         sys_replies.append(detail if detail else f"这里没有 {it_name}。")
                         found_any = True
-                if not found_any:
+                if not sys_replies:
+                    sys_replies.append("【系统】这里什么都没有。")
+                if not found_any and "【系统】这里什么都没有。" not in sys_replies:
                     sys_replies.append(f"你把{scene}翻了个遍，没有更多发现。")
             else:
                 # 单物品调查
@@ -309,9 +321,9 @@ async def action_engine(state: AgentState) -> dict:
                     desc_txt = desc.rstrip("。. ")
                     parsed_content = _parse_content(it.get("content"))
                     
-                    if it_name in new_items and "（锁着，需要" not in str(desc_map.get(it_name, "")):
+                    if it_name in _get_item_names(new_items) and "（锁着，需要" not in str(desc_map.get(it_name, "")):
                         continue
-                    if it_name in new_items and f"__agreed__:{it_name}" in desc_map:
+                    if it_name in _get_item_names(new_items) and f"__agreed__:{it_name}" in desc_map:
                         rem_str = ""
                         m = re.search(r"还缺(.+?)(?:）|$)", desc_map.get(it_name, ""))
                         if m:
@@ -319,18 +331,9 @@ async def action_engine(state: AgentState) -> dict:
                         rem_keys = [k.strip() for k in re.split(r"[+＋、,，]", rem_str) if k.strip()]
                         missing = [k for k in rem_keys if not player_has_key(k, new_items, props) and key_owner_npc(k, props) is None]
                         if not missing:
-                            subs_raw = desc_map.get(f"__content__:{it_name}", "")
-                            subs = [x.strip() for x in subs_raw.split(",") if x.strip()]
-                            for s in subs:
-                                if s not in new_items:
-                                    new_items.append(s)
-                            base_desc = desc if desc else desc_map.get(it_name, "").split("（锁着")[0].strip()
-                            desc_map[it_name] = f"{base_desc}（已开启）"
-                            if f"__agreed__:{it_name}" in desc_map:
-                                del desc_map[f"__agreed__:{it_name}"]
-                            if f"__content__:{it_name}" in desc_map:
-                                del desc_map[f"__content__:{it_name}"]
-                            sys_replies.append(f"你打开了「{it_name}」，里面是：{'、'.join(subs) or '（空）'}。")
+                            subs = handle_container_open(it_name, desc_map, props, new_items, scenes)
+                            ui_events.append({"type": "container_opened", "container": it_name, "revealed_items": list(subs)})  # 2D frontend
+                            sys_replies.append(f"你打开了「{it_name}」，子物品是：{'、'.join(subs) or '（空）'}。")
                             found_any = True
                             continue
                         else:
@@ -338,7 +341,7 @@ async def action_engine(state: AgentState) -> dict:
                             found_any = True
                             continue
                             
-                    if it_name in new_items and "（锁着，需要" in str(desc_map.get(it_name, "")):
+                    if it_name in _get_item_names(new_items) and "（锁着，需要" in str(desc_map.get(it_name, "")):
                         m = re.search(r"（锁着，需要(.+?)）", desc_map.get(it_name, ""))
                         lock_name = m.group(1) if m else ""
                         keys = split_keys(lock_name)
@@ -347,23 +350,14 @@ async def action_engine(state: AgentState) -> dict:
                             sys_replies.append(f"「{it_name}」还缺{'、'.join(missing)}才能打开。")
                             found_any = True
                             continue
-                        subs_raw = desc_map.get(f"__content__:{it_name}", "")
-                        subs = [x.strip() for x in subs_raw.split(",") if x.strip()]
-                        for s in subs:
-                            if s not in new_items:
-                                new_items.append(s)
-                        base_desc = desc if desc else desc_map.get(it_name, "").split("（锁着")[0].strip()
-                        desc_map[it_name] = f"{base_desc}（已开启）"
-                        if f"__content__:{it_name}" in desc_map:
-                            del desc_map[f"__content__:{it_name}"]
-                        sys_replies.append(f"你打开了「{it_name}」，里面是：{'、'.join(subs) or '（空）'}。")
+                        subs = handle_container_open(it_name, desc_map, props, new_items, scenes)
+                        sys_replies.append(f"你打开了「{it_name}」，子物品是：{'、'.join(subs) or '（空）'}。")
                         found_any = True
                         continue
                         
                     status, detail = can_acquire(it, npcs, new_items, props, scene)
                     if status == "free":
-                        if it_name not in new_items:
-                            new_items.append(it_name)
+                        _upsert_item(new_items, it_name, count=1)
                         if not is_prop:
                             _si = (scenes.get(scene) or {}).get("items", [])
                             if isinstance(_si, list):
@@ -382,17 +376,25 @@ async def action_engine(state: AgentState) -> dict:
                                 if ("：" in _cname or ":" in _cname) and len(_cname) > 10 and not _ctext:
                                     _ctext = _cname
                                     _cname = f"{it_name}内容"
-                                if _cname not in new_items:
-                                    new_items.append(_cname)
+                                if _cname not in _get_item_names(new_items):
+                                    _upsert_item(new_items, _cname, count=1)
                                 _full_desc = _ctext if _ctext else desc_map.get(_cname, "")
                                 if _full_desc:
                                     desc_map[_cname] = _full_desc
+                                _cur_desc = str(desc_map.get(_cname, "") or "")
+                                if (not _cur_desc) or (_cur_desc.startswith("在") and "内部" in _cur_desc):
+                                    _sp = next((pp for pp in props if pp.get("name") == _cname), None)
+                                    if _sp and _sp.get("desc"):
+                                        desc_map[_cname] = str(_sp.get("desc")).strip()
+                                for _pp in props:
+                                    if _pp.get("name") == _cname:
+                                        _pp.pop("container", None)
                             desc_map[it_name] = f"{_desc_out}（已开启）"
                             _sub_names = [c.get("name", "") for c in parsed_content]
                             _holder = it.get("holder", "")
                             _is_npc_item = _holder and _holder not in ("玩家", "玩家身上", "")
                             if _is_npc_item:
-                                sys_replies.append(f"你拿走了「{it_name}」（这是{_holder}的东西），里面是：{'、'.join(_sub_names)}。")
+                                sys_replies.append(f"你拿走了「{it_name}」，这是{_holder}的东西，里面是：{'、'.join(_sub_names)}。")
                             else:
                                 sys_replies.append(f"你拿走了「{it_name}」，里面是：{'、'.join(_sub_names)}。")
                         else:
@@ -400,7 +402,7 @@ async def action_engine(state: AgentState) -> dict:
                             _holder = it.get("holder", "")
                             _is_npc_item = _holder and _holder not in ("玩家", "玩家身上", "")
                             if _is_npc_item:
-                                sys_replies.append(f"你拿走了「{it_name}」（这是{_holder}的东西）。")
+                                sys_replies.append(f"你拿走了「{it_name}」，这是{_holder}的东西。")
                             else:
                                 sys_replies.append(f"你拿走了「{it_name}」。")
                         
@@ -427,22 +429,38 @@ async def action_engine(state: AgentState) -> dict:
                             sys_replies.append(f"「{it_name}」需要{owner}的凭证锁，需{owner}本人同意才能打开（用 !@N 给我 {it_name}）")
                             found_any = True
                         else:
-                            new_items.append(it_name)
+                            _upsert_item(new_items, it_name, count=1)
                             if not is_prop:
                                 _si = (scenes.get(scene) or {}).get("items", [])
                                 if isinstance(_si, list):
                                     scenes[scene]["items"] = [x for x in _si if not (isinstance(x, dict) and x.get("name") == it_name)]
                             desc_map[it_name] = f"{desc}（锁着，需要{detail}）"
-                            sub_names = [c["name"] for c in parsed_content]
-                            desc_map[f"__content__:{it_name}"] = ",".join(sub_names)
+                            desc_map[f"__content__:{it_name}"] = json.dumps(parsed_content, ensure_ascii=False)
+                            for _c in (parsed_content or []):
+                                _cn = _c.get("name") if isinstance(_c, dict) else str(_c)
+                                _cn = str(_cn or "").strip()
+                                if not _cn:
+                                    continue
+                                _rd = _resolve_sub_desc(_cn, it_name, props, scenes, desc_map)
+                                if _rd:
+                                    desc_map[_cn] = _rd
+                                else:
+                                    _ph = desc_map.get(_cn, "")
+                                    if isinstance(_ph, str) and "内部" in _ph:
+                                        desc_map.pop(_cn, None)
+                                    for _it in new_items:
+                                        if isinstance(_it, dict) and str(_it.get("name", "")).strip() == _cn:
+                                            _d0 = str(_it.get("desc", "") or "")
+                                            if "内部" in _d0:
+                                                _it["desc"] = ""
                             sys_replies.append(f"你发现了「{it_name}」：{desc_txt}。它锁着，还缺{detail}才能打开。")
                             found_any = True
                             
                     elif status == "npc_present":
                         if it.get("carried"):
-                            sys_replies.append(f"「{it_name}」在{detail}身上（随身携带），你需要向TA索要（!@N 给物）或偷取（!偷）。")
+                            sys_replies.append(f"「{it_name}」在{detail}身上（随身携带），需要向 TA 索要或偷取。")
                         else:
-                            sys_replies.append(f"「{it_name}」被{detail}盯着，需先支开TA，或走 !@N 给物 / !偷。")
+                            sys_replies.append(f"「{it_name}」在{detail}身上，需先支开他，或尝试偷取。")
                         found_any = True
                     elif status == "unknown":
                         sys_replies.append(detail if detail else f"这里没有 {it_name}。")
@@ -450,6 +468,8 @@ async def action_engine(state: AgentState) -> dict:
                 if not found_any:
                     sys_replies.append(f"你把{scene}翻了个遍，没有更多发现。")
 
+    if not sys_replies:
+        sys_replies.append(f"你把{scene}翻了个遍，没有更多发现。")
     return {
         "current_scene": new_scene,
         "player_items": new_items,
@@ -457,5 +477,6 @@ async def action_engine(state: AgentState) -> dict:
         "item_desc_map": desc_map,
         "opened_scenes": opened,
         "scenes": scenes,
+        "ui_events": ui_events,
         "history": [{"speaker": "system", "content": f"【系统】{' '.join(sys_replies)}"}],
     }

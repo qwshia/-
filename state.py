@@ -55,9 +55,10 @@ class AgentState(TypedDict):
 
     current_scene: str
     time_phase: str                                 # 当前时间档（按轮数比例动态推进）；无时间压力时为空
-    player_items: List[str]                         # 普通字段：item_node / action_engine 整体写回（可增可减）
+    player_items: List[dict]                         # 普通字段：item_node / action_engine 整体写回（可增可减）
     player_name: str                                # 玩家名字（导演开局创建，NPC 直接知道）
     player_attire: str                              # 玩家当前穿着（同场景 NPC 可见）
+    player_intent: dict                             # 本轮玩家意图（intent 节点产出：intent_type/command/confidence/clean_msg/source）
     item_desc_map: Dict[str, str]                   # 道具用途表（导演初始从场景汇总，动态获得由 item_node 补充）
     item_transfers: Annotated[List[dict], operator.add]  # NPC 同意给予的物品（reducer 收集，item_node 消费）
     processed_transfers: List[str]                  # 已消费的给予指纹（防 reducer 累积重复处理）
@@ -67,6 +68,7 @@ class AgentState(TypedDict):
     world_events: Annotated[List[str], operator.add]
     game_over: bool
     steal_attempts: Dict[str, int]                  # 偷窃次数记录（保底用）
+    ui_events: Annotated[List[dict], operator.add]  # UI 事件总线（给物品/移动/换装/获得物品等物理交互事件，reducer 追加）
     npc_private_items: Dict[str, list]              # NPC 私有物品表（固定，NPC 验证用）
 
     user_msg: str

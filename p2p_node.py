@@ -12,7 +12,7 @@ from langchain_core.messages import HumanMessage
 from config import actor_llm
 from state import AgentState
 from memory import _compress, _compress_two
-from utils import time_advance
+from utils import time_advance, _format_attire
 
 _P2P_RE = re.compile(
     r"(?:让|叫|请|麻烦|安排)?\s*"
@@ -79,7 +79,7 @@ def _role_block(info: dict, npc_id: str) -> str:
     mem_text = "\n".join(mem_lines) if mem_lines else "（你们之间还没有过接触）"
     return (
         f"姓名：{name} | 身份：{info.get('role', '路人')}\n"
-        f"性格：{info.get('personality', '普通')} | 外貌：{info.get('appearance', '普通')} | 衣着：{info.get('attire', '常服')}\n"
+        f"性格：{info.get('personality', '普通')} | 外貌：{info.get('appearance', '普通')} | 衣着：{_format_attire(info.get('attire', {}))}\n"
         f"真实目标：{info.get('goal', '')}\n"
         f"【认知状态】\n{cognition_text}\n"
         f"【你的个人记忆】\n{mem_text}\n"
@@ -114,7 +114,7 @@ async def p2p_node(state: AgentState) -> dict:
     attire_words = ("衣服", "服装", "服饰", "衣着", "穿着", "穿上", "脱掉", "脱下", "换衣", "换装",
                     "打扮", "装束", "裙子", "衣衫", "光着", "赤裸", "外套", "外袍", "衬衫", "鞋袜")
     if any(w in msg for w in attire_words):
-        locs_txt = "、".join(f"{i.get('name', '?')}(在{i.get('location', '?')}，穿{i.get('attire', '常服')})"
+        locs_txt = "、".join(f"{i.get('name', '?')}(在{i.get('location', '?')}，穿{_format_attire(i.get('attire', {}))})"
                              for i in npcs.values() if i.get("location") == scene) or "（无）"
         locs_line = f"本场景在场NPC的位置与穿着：{locs_txt}\n"
     else:

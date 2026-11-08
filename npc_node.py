@@ -6,10 +6,10 @@ from langchain_core.messages import HumanMessage
 from config import actor_llm
 from state import AgentState
 from stream_bus import inc_registered, push_chunk, push_end, push_start
-from parsing import _parse_attire_change, _parse_player_attire, _parse_item_request, _parse_npc_move, _apply_attire, _is_npc_command, _strip_npc_cmd_prefix
+from parsing import _apply_attire, _is_npc_command, _strip_npc_cmd_prefix
 from memory import _compress, _compress_two
-from item_utils import key_owner_npc, split_keys, player_has_key, prop_location
-from utils import _parse_content
+from item_utils import key_owner_npc, split_keys, player_has_key, prop_location, key_name_of
+from utils import _parse_content, _format_attire, _get_item_names
 
 
 def _safe_int(v, default=0):
@@ -22,14 +22,14 @@ def _safe_int(v, default=0):
 def _cut_at_marks(s: str) -> str:
     """返回 s 中第一个 [aff:/【aff:/[do:/【do: 标记之前的部分（流式推送用，避免把标记推给播放器）。"""
     cut = len(s)
-    for mk in ("[aff:", "【aff:", "[do:", "【do:"):
+    for mk in ("[aff:", "【aff:", "[do:", "【do:", "[do_items", "【do_items"):
         i = s.find(mk)
         if i != -1 and i < cut:
             cut = i
     return s[:cut]
 
 
-async def _npc_respond(prompt: str, npc_id: str) -> tuple[str, bool, int, bool]:
+async def _npc_respond(prompt: str, npc_id: str, requested_items=None) -> tuple[str, bool, int, bool, list]:
     inc_registered()
     await push_start(npc_id)
     full = ""
@@ -47,18 +47,34 @@ async def _npc_respond(prompt: str, npc_id: str) -> tuple[str, bool, int, bool]:
         await push_end(npc_id)
     except Exception:
         await push_end(npc_id)
-        return "（网络异常，没有说话。）", False, 0, False
-    m = re.search(r"[\[【]\s*aff\s*[:：]\s*([+-]?\d+)\s*[\]】]", full)
+        return "（网络异常，没有说话。）", False, 0, False, []
+    m = re.search(r"[\[【(（]\s*aff\s*[:：]\s*([+-]?\d+)\s*[\]】)）]", full)
     aff_change = int(m.group(1)) if m else 0
     aff_change = max(-40, min(40, aff_change))
-    m_do = re.search(r"[\[【]\s*do\s*[:：]\s*([yn])\s*[\]】]", full, re.I)
-    consent = bool(m_do) and m_do.group(1).lower() == "y"
-    content = re.sub(r"[\[【]\s*(?:aff\s*[:：]\s*[+-]?\d+|do\s*[:：]\s*[yn])\s*[\]】]", "", full, flags=re.I).strip()
+    m_items = re.search(r"[\[【(（]\s*do_items\s*[:：]\s*([^\]】)）]+)[\]】)）]", full, re.I)
+    if m_items:
+        consented_items = [x.strip() for x in re.split(r"[,，、\s]+", m_items.group(1)) if x.strip()]
+        consent = True
+    else:
+        m_do = re.search(r"[\[【(（]\s*do\s*[:：]\s*([yn])\s*[\]】)）]", full, re.I)
+        consent = bool(m_do) and m_do.group(1).lower() == "y"
+        if consent:
+            consented_items = list(requested_items or [])
+        else:
+            consented_items = []
+    # 兜底：模型光说不练
+    if not m_items and not (m_do and m_do.group(1).lower() == "y"):
+        if any(w in full for w in ("给你", "拿去", "拿去吧", "这就给")):
+            consent = True
+            consented_items = list(requested_items or [])
+    content = re.sub(r"[\[【]\s*aff\s*[:：]\s*[+-]?\d+\s*[\]】]", "", full, flags=re.I)
+    content = re.sub(r"[\[【]\s*do\s*[:：]\s*[yn]\s*[\]】]", "", content, flags=re.I)
+    content = re.sub(r"[\[【]\s*do_items\s*[:：][^\]】]*[\]】]", "", content, flags=re.I)
     content = re.sub(r"[\[【][^\]】]*$", "", content).strip()
     content = re.sub(r"[\[【]\s*$", "", content).strip()
     if not content:
         content = "（没有说话。）"
-    return content, True, aff_change, consent
+    return content, True, aff_change, consent, consented_items
 
 
 # NPC 执行器：生成回复、更新好感/衣着/位置/记忆
@@ -74,12 +90,58 @@ async def npc_worker(state: AgentState) -> dict:
     is_cmd = _is_npc_command(user_msg)
     if is_cmd:
         user_msg = _strip_npc_cmd_prefix(user_msg)
-    player_items = list(state.get("player_items") or [])
+
+    player_intent = state.get("player_intent") or {}
+    intent_type = player_intent.get("intent_type", "chat")
+    intent_command = player_intent.get("command")
+    clean_msg = player_intent.get("clean_msg") or user_msg
+
+    attire_change = None
+    requested_items = []
+    move_target = None
+
+    if isinstance(intent_command, dict):
+        ctype = intent_command.get("type")
+        citem = intent_command.get("item")
+        cscene = intent_command.get("scene")
+        caction = intent_command.get("action")
+        if ctype in ("wear", "attire", "attire_change"):
+            if isinstance(citem, list):
+                attire_items = [str(x) for x in citem if x]
+            elif isinstance(citem, str) and citem:
+                attire_items = [citem]
+            else:
+                attire_items = []
+            if attire_items:
+                action = caction or ("take_off" if "全部" in attire_items else "put_on")
+                if "全部" in attire_items:
+                    attire_change = (action, "全部")
+                else:
+                    attire_change = (action, attire_items)
+        if ctype in ("give_item", "item", "give"):
+            if isinstance(citem, list):
+                requested_items = [str(x) for x in citem if x]
+            elif isinstance(citem, str) and citem:
+                requested_items = [citem]
+            else:
+                requested_items = []
+        if ctype in ("move", "go"):
+            move_target = cscene
+
+    user_msg = clean_msg
+    player_items = _get_item_names(state.get("player_items") or [])
     name = info.get("name", npc_id)
     role = info.get("role", "路人")
     personality = info.get("personality", "普通")
     appearance = info.get("appearance", "普通")
-    attire = info.get("attire", "常服")
+    attire_raw = info.get("attire", {})
+    if isinstance(attire_raw, str):
+        attire = {"全装": attire_raw.strip()} if attire_raw.strip() and attire_raw.strip() not in ("", "无") else {}
+    elif isinstance(attire_raw, dict):
+        attire = dict(attire_raw)
+    else:
+        attire = {}
+    attire_text = _format_attire(attire)
     goal = info.get("goal", "")
     secrets = [str(s) for s in (info.get("secrets") or [])]
     forbidden = [str(f) for f in (info.get("forbidden") or [])]
@@ -105,27 +167,22 @@ async def npc_worker(state: AgentState) -> dict:
     hallucinations_txt = "\n".join(f"- {h}" for h in hallucinations) or "（无）"
 
     player_name = state.get("player_name", "")
-    player_attire = state.get("player_attire", "普通衣着")
     player_location = scene
     npc_location = info.get("location", scene)
     events = state.get("world_events") or []
     recent_events = "；".join(events[-3:]) if events else "（无）"
 
-    player_attire_change = _parse_player_attire(user_msg)
-    if player_attire_change:
-        player_attire = _apply_attire(player_attire, player_attire_change[0], player_attire_change[1])
-    attire_change = _parse_attire_change(user_msg)
-
     available_scenes = state.get("available_scenes") or []
-    move_target = _parse_npc_move(user_msg, available_scenes) if is_cmd else None
     move_blocked = False
+    if move_target and move_target not in available_scenes:
+        move_target = None
     if move_target:
         rk = str((state.get("scenes") or {}).get(move_target, {}).get("requires_key", "") or "").strip()
         if rk:
             need = [k.strip() for k in rk.split("+") if k.strip()]
             if move_target in (state.get("opened_scenes") or []):
                 need = []
-            player_items = state.get("player_items") or []
+            player_items = _get_item_names(state.get("player_items") or [])
             missing = [k for k in need if k not in player_items]
             if missing:
                 npc_has = all(any(p.get("name") == k and p.get("holder") == name for p in props) for k in missing)
@@ -136,17 +193,15 @@ async def npc_worker(state: AgentState) -> dict:
     props = state.get("props") or []
     scenes = state.get("scenes") or {}
 
-    requested_item = _parse_item_request(user_msg, props, name)
-
     available_scenes = state.get("available_scenes") or []
     all_npcs = state.get("npcs") or {}
-    items = state.get("player_items") or []
+    items = _get_item_names(state.get("player_items") or [])
     player_items = list(items)
     desc_map = state.get("item_desc_map") or {}
     _snap_items = state.get("npc_private_items", {}).get(npc_id, [])
     lookup_lines = []
     if any(w in user_msg for w in ("衣服", "穿着", "穿", "脱", "外套")):
-        lookup_lines.append(f"玩家问到了你的穿着，你当前的真实衣着是：{attire}。")
+        lookup_lines.append(f"玩家问到了你的穿着，你当前的真实衣着是：{attire_text}。")
     if move_target:
         sdef = scenes.get(move_target, {})
         lookup_lines.append(f"场景「{move_target}」：{sdef.get('desc', '')}")
@@ -155,7 +210,7 @@ async def npc_worker(state: AgentState) -> dict:
         if nname2 and nname2 in user_msg and nid2 != npc_id:
             _nloc = ninfo2.get('location','')
             _npos = "在当前场景" if _nloc == scene else f"在{_nloc}"
-            lookup_lines.append(f"NPC「{nname2}」：身份{ninfo2.get('role','')}，外貌{ninfo2.get('appearance','')}，性格{ninfo2.get('personality','')}，衣着{ninfo2.get('attire','')}，{_npos}")
+            lookup_lines.append(f"NPC「{nname2}」：身份{ninfo2.get('role','')}，外貌{ninfo2.get('appearance','')}，性格{ninfo2.get('personality','')}，衣着{_format_attire(ninfo2.get('attire', {}))}，{_npos}")
     if not is_cmd and len(all_npcs) > 1:
         _mentioned_other = any(info.get("name") in user_msg for nid, info in all_npcs.items() if nid != npc_id)
         if not _mentioned_other:
@@ -171,7 +226,12 @@ async def npc_worker(state: AgentState) -> dict:
                     else:
                         _pos = f"在{_p.get('location', '某处')}"
                     lookup_lines.append(f"物品「{_p.get('name')}」：{_p.get('desc','')}，{_pos}")
-    for nm in set(items) | {p.get("name") for p in props if p.get("name")} | set(_snap_items):
+    _all_names = set(items) | {p.get("name") for p in props if p.get("name")} | set(_snap_items)
+    for _cp in props:
+        for _c in (_parse_content(_cp.get("content")) or []):
+            if _c.get("name"):
+                _all_names.add(str(_c.get("name")).strip())
+    for nm in _all_names:
         if nm and nm in user_msg:
             if nm in _snap_items:
                 still_has = any(p.get("name") == nm and p.get("holder") == name for p in props)
@@ -182,15 +242,18 @@ async def npc_worker(state: AgentState) -> dict:
                 continue
             pp = next((p for p in props if p.get("name") == nm), None)
             if pp:
-                _loc = prop_location(pp, all_npcs)
-                if _loc == "player":
-                    _pos = "在你背包"
-                elif _loc.startswith("npc:"):
-                    _pos = f"在{_loc[4:]}身上"
-                elif _loc.startswith("scene:"):
-                    _pos = f"在{_loc[6:]}"
+                if pp.get("container"):
+                    _pos = f"在「{pp.get('container')}」内部"
                 else:
-                    _pos = _loc
+                    _loc = prop_location(pp, all_npcs)
+                    if _loc == "player":
+                        _pos = "在你背包"
+                    elif _loc.startswith("npc:"):
+                        _pos = f"在{_loc[4:]}身上"
+                    elif _loc.startswith("scene:"):
+                        _pos = f"在{_loc[6:]}"
+                    else:
+                        _pos = _loc
                 _holder = pp.get("holder", "")
                 if _holder and _holder not in (name, "玩家", "玩家身上", ""):
                     lookup_lines.append(f"物品「{nm}」：这是{_holder}的东西，{_pos}，具体用途不详")
@@ -201,7 +264,16 @@ async def npc_worker(state: AgentState) -> dict:
                     _sub = "；".join(f"{c['name']}" + (f"：{c['text']}" if c.get("text") else "") for c in _parsed_c)
                     lookup_lines.append(f"（内含：{_sub}）")
             else:
-                lookup_lines.append(f"物品「{nm}」：{desc_map.get(nm, '')}")
+                _container = None
+                for _cp in props:
+                    _subs = _parse_content(_cp.get("content"))
+                    if any(str(c.get("name", "")).strip() == nm for c in _subs):
+                        _container = _cp.get("name")
+                        break
+                if _container:
+                    lookup_lines.append(f"物品「{nm}」：在「{_container}」内部")
+                else:
+                    lookup_lines.append(f"物品「{nm}」：{desc_map.get(nm, '')}")
     if lookup_lines:
         lookup_section = "【本次检索结果】\n" + "\n".join(lookup_lines)
     else:
@@ -210,12 +282,22 @@ async def npc_worker(state: AgentState) -> dict:
     cmd_parts = []
     if attire_change:
         act = "穿上" if attire_change[0] == "put_on" else "脱掉"
-        cmd_parts.append(f"让你{act}「{attire_change[1]}」")
-    if requested_item:
-        cmd_parts.append(f"让你把「{requested_item}」交给玩家")
+        _attire_items = attire_change[1]
+        if isinstance(_attire_items, (list, tuple)):
+            _attire_txt = "、".join(str(x) for x in _attire_items)
+        else:
+            _attire_txt = str(_attire_items)
+        cmd_parts.append(f"让你{act}「{_attire_txt}」")
+    if requested_items:
+        items_txt = "、".join(requested_items)
+        cmd_parts.append(
+            f"玩家向你索要以下物品：{items_txt}。根据你的性格决定交出哪些。"
+            f"如果你同意，请在末尾输出 [do_items: 物品A, 物品B]（仅限你拥有的）；"
+            f"如果全拒绝，输出 [do:n]。严禁交出你不拥有的物品。"
+        )
     if move_target:
         cmd_parts.append(f"让你前往「{move_target}」")
-    if is_cmd and cmd_parts:
+    if cmd_parts:
         cmd_section = (
             "\n[本轮指令]\n"
             f"玩家正在对你下达指令：{'；'.join(cmd_parts)}。\n"
@@ -225,10 +307,16 @@ async def npc_worker(state: AgentState) -> dict:
     else:
         cmd_section = ""
 
+    intent_section = ""
+    if intent_type == "mixed":
+        intent_section = "玩家的话里既有情绪也有指令，请先回应情绪，再根据人设决定是否执行指令。\n"
+    elif intent_type == "command":
+        intent_section = "本轮以执行指令为主，回应尽量简短。\n"
+
     prompt = f"""你是互动叙事中的NPC.当前这句话是回应对象;同时参考下方全部信息来保持关系,承诺,语气与状态连续.请你阅读全部提示词并思考后回答.只输出角色回复,不代写玩家,不开启新场景/新事件.本设定只用于生成你的回话或你的即时状态变化(好感度,衣着),不用于判定,生成场景或其他NPC行为.
 
 [你的角色]
-姓名:{name} | 身份:{role} | 当前衣着:{attire}
+姓名:{name} | 身份:{role} | 当前衣着:{attire_text}
 性格:{personality} | 外貌:{appearance}
 真实目标:{goal}
 
@@ -266,12 +354,13 @@ async def npc_worker(state: AgentState) -> dict:
 3. 状态同步：动作必须基于当前真实衣着！若无衣物，严禁出现衣物摩擦描写。
 
 {cmd_section}
+{intent_section}
 [玩家当前对你说]
 {user_msg}
 请以角色口吻回答.格式:`(动作/神态) 说话内容`,字数控制在40~100字.末尾必须标注[aff:数字]"""
 
-    content, ok, aff_change, consent = await _npc_respond(prompt, npc_id)
-    if not is_cmd:
+    content, ok, aff_change, consent, consented_items = await _npc_respond(prompt, npc_id, requested_items)
+    if not is_cmd and not cmd_parts:
         consent = False
 
     round_entry = f"玩家：{user_msg}"
@@ -305,38 +394,85 @@ async def npc_worker(state: AgentState) -> dict:
     }
 
     sys_msgs = []
+    ui_events = []
     if move_target and not move_blocked and ok and consent:
         npc_patch[npc_id]["location"] = move_target
         if move_target not in (state.get("opened_scenes") or []):
             out["opened_scenes"] = [move_target]
         sys_msgs.append(f"【系统】{name}去了{move_target}。")
+        ui_events.append({"type": "npc_move", "npc": name, "target_scene": move_target})  # 2D frontend
     elif move_blocked:
         sys_msgs.append(f"【系统】{name}无法前往该场景（缺少凭证）。")
+        ui_events.append({"type": "action_feedback", "target": name, "action": "threatened", "shake_screen": True})  # 2D frontend
 
     if attire_change and ok and consent:
         new_attire = _apply_attire(attire, attire_change[0], attire_change[1])
         npc_patch[npc_id]["attire"] = new_attire
-        sys_msgs.append(f"【系统】{name}的穿着：{new_attire if new_attire else '无'}。")
-    if player_attire_change:
-        out["player_attire"] = _apply_attire(player_attire, player_attire_change[0], player_attire_change[1])
-        sys_msgs.append(f"【系统】玩家衣着已更新。")
+        sys_msgs.append(f"【系统】{name}的穿着更新为：{_format_attire(new_attire)}。")
+        ui_events.append({"type": "attire_change", "npc": name, "action": attire_change[0], "current_attire": new_attire})  # 2D frontend
 
-    if requested_item and ok and consent:
-        _target_p = next((p for p in props if p.get("name") == requested_item), None)
-        if _target_p and _target_p.get("locked"):
-            _keys = split_keys(_target_p.get("key_name", ""))
-            _can_npc_open = all(key_owner_npc(k, props) == name for k in _keys if not player_has_key(k, player_items, props))
-            if _can_npc_open:
-                out["item_transfers"] = [{"item": requested_item, "from": npc_id, "auto_open": True}]
-                sys_msgs.append(f"【系统】{name}用自己的凭证打开了{requested_item}，里面的东西已放入背包。")
-            else:
-                out["item_transfers"] = [{"item": requested_item, "from": npc_id}]
-                sys_msgs.append(f"【系统】{requested_item}（锁着）在背包。")
+    if (requested_items or consented_items) and ok:
+        if consented_items:
+            agreed_list = [str(x).strip() for x in consented_items if str(x).strip()]
+        elif consent:
+            agreed_list = [str(x).strip() for x in (requested_items or []) if str(x).strip()]
         else:
-            out["item_transfers"] = [{"item": requested_item, "from": npc_id}]
-            sys_msgs.append(f"【系统】{requested_item}在背包。")
+            agreed_list = []
+        # 去重保序
+        _seen = set()
+        agreed_list = [x for x in agreed_list if not (x in _seen or _seen.add(x))]
+        consented_set = set(agreed_list)
+        transfers = []
+        missing_items = []
+        for it in agreed_list:
+            # 子物品穿透拦截：锁住的容器内的子物品不能直接转移
+            _parent_box = None
+            for _cp in props:
+                if any(str(_c.get("name", "")).strip() == it for _c in (_parse_content(_cp.get("content")) or [])):
+                    _parent_box = _cp
+                    break
+            if _parent_box is not None and _parent_box.get("locked"):
+                sys_msgs.append(f"【系统】「{it}」锁在「{_parent_box.get('name')}」里，需要先拿到并打开宝盒。")
+                continue
+            if it not in consented_set:
+                continue
+            tp = next((p for p in props if p.get("name") == it), None)
+            if tp is None and it not in (_snap_items or []):
+                missing_items.append(it)
+                continue
+            locked = bool(tp and tp.get("locked"))
+            if locked:
+                keys = split_keys(key_name_of(tp)) if tp else []
+                npc_owners = [key_owner_npc(k, props) for k in keys]
+                is_npc_cred = bool(keys) and any(o is not None for o in npc_owners)
+                if is_npc_cred:
+                    transfers.append({"item": it, "from": npc_id, "auto_open": True})
+                    sys_msgs.append(f"【系统】{name}用自己的凭证打开了{it}，里面的东西已放入背包。")
+                    ui_events.append({"type": "item_transfer", "item": it, "count": 1, "from_npc": name, "to_player": True})  # 2D frontend
+                else:
+                    transfers.append({"item": it, "from": npc_id})
+                    ui_events.append({"type": "item_transfer", "item": it, "count": 1, "from_npc": name, "to_player": True})  # 2D frontend
+            else:
+                transfers.append({"item": it, "from": npc_id})
+                ui_events.append({"type": "item_transfer", "item": it, "count": 1, "from_npc": name, "to_player": True})  # 2D frontend
+        if missing_items:
+            sys_msgs.append(f"【系统】{name}身上似乎没有「{'、'.join(missing_items)}】。")
+        for tr in transfers:
+            sys_msgs.append(f"【系统】{name}把「{tr['item']}」交给了你。")
+        if transfers:
+            out["item_transfers"] = transfers
+
+    if aff_change <= -15:
+        ui_events.append({"type": "action_feedback", "target": name, "action": "angry", "shake_screen": True})  # 2D frontend
 
     if sys_msgs:
-        out["history"] = out["history"] + [{"speaker": "system", "content": m} for m in sys_msgs]
+        existing = {e.get("content") for e in (out.get("history") or []) if isinstance(e, dict)}
+        for m in sys_msgs:
+            if m not in existing:
+                out["history"].append({"speaker": "system", "content": m})
+                existing.add(m)
+
+    if ui_events:
+        out["ui_events"] = ui_events
 
     return out

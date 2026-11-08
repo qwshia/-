@@ -34,10 +34,13 @@ def split_keys(key_name):
     return [k.strip() for k in re.split(r"[+＋]", key_name) if k.strip()]
 
 
+from utils import _get_item_names
+
+
 def player_has_key(key, player_items, props):
     if not key:
         return False
-    if key in player_items:
+    if key in _get_item_names(player_items):
         return True
     for p in (props or []):
         if p.get("name") == key and p.get("holder") in ("玩家", "玩家身上"):
@@ -57,10 +60,16 @@ def npc_carries_key(key, npc_name, props):
 def key_owner_npc(key, props):
     if not key:
         return None
+    if "钥匙" in str(key):
+        return None
+    _BIO_WORDS = ("指纹", "虹膜", "密码", "凭证", "瞳孔", "DNA")
     for p in (props or []):
         if (p.get("name") == key and p.get("carried")
                 and p.get("holder") and p.get("holder") not in ("玩家", "玩家身上")):
-            return p.get("holder")
+            _desc = str(p.get("desc", "") or "")
+            _name = str(p.get("name", "") or "")
+            if any(w in _desc or w in _name for w in _BIO_WORDS):
+                return p.get("holder")
     return None
 
 

@@ -29,6 +29,7 @@ from state import AgentState, load_checkpointer
 from world import world_genesis
 from input_node import record_input, fan_out
 from npc_node import npc_worker
+from intent_node import intent_engine
 from action_node import action_engine
 from item_node import item_node, is_steal_cmd
 from story_node import story_keeper
@@ -84,6 +85,7 @@ def build_graph(checkpointer=None):
     g = StateGraph(AgentState)
     g.add_node("world_genesis", world_genesis)
     g.add_node("record_input", record_input)
+    g.add_node("intent_engine", intent_engine)
     g.add_node("npc_worker", npc_worker)
     g.add_node("action_engine", action_engine)
     g.add_node("item_node", item_node)
@@ -110,7 +112,12 @@ def build_graph(checkpointer=None):
     g.add_edge("world_genesis", "sync_status")
 
     g.add_conditional_edges(
-        "record_input", fan_out,
+        "record_input",
+        lambda s: "intent_engine" if (s.get("active_targets") or []) else "sync_status",
+        {"intent_engine": "intent_engine", "sync_status": "sync_status"},
+    )
+    g.add_conditional_edges(
+        "intent_engine", fan_out,
         {"sync_status": "sync_status"},
     )
     g.add_edge("npc_worker", "item_node")
