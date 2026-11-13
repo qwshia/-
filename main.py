@@ -91,16 +91,8 @@ def _print_roster(result: dict) -> None:
     print("=" * 40)
 
 
-async def _stream_player(names: dict) -> None:
-    """消费 stream_bus 队列，按 NPC 排队流式播放。
-
-    同一时刻只播放一个 NPC 的流：播放中收到其他 NPC 的 chunk 先存 buffer，
-    当前 NPC 播完（end）才切下一个——多个 NPC 并行生成也不会串线。
-    状态机要点：
-    - header 只在"真的有内容要播"时打一次（header_shown），空回复不显示空名字；
-    - 不用 playing 锁：NPC 失败重试/兜底的 start→chunk→end 序列到达时，
-      只要 chunk 有内容就继续播（header 不重复），杜绝"打了名字却没内容"的假死。
-    """
+async def _stream_player(names: dict, silent: bool = False) -> None:
+    """消费 stream_bus 队列，按 NPC 排队流式播放。silent=True 时不打印文本。"""
     import stream_bus
 
     q = _sb_queue()
@@ -108,6 +100,8 @@ async def _stream_player(names: dict) -> None:
     buffers: dict[str, dict] = {}
 
     def _header(nid: str) -> None:
+        if silent:
+            return
         display = names.get(nid, nid)
         color = C_YELLOW if str(nid).endswith("1") else C_CYAN
         print(f"\n{color}[{display}]{C_RESET} ", end="", flush=True)
@@ -123,9 +117,13 @@ async def _stream_player(names: dict) -> None:
                     _header(nid)
                 current = nid
                 while buf["chunks"]:
-                    print(buf["chunks"].pop(0), end="", flush=True)
+                    if not silent:
+                        print(buf["chunks"].pop(0), end="", flush=True)
+                    else:
+                        buf["chunks"].pop(0)
                 if buf["ended"]:
-                    print()
+                    if not silent:
+                        print()
                     current = None
                     _try_play()
                 return
@@ -148,7 +146,8 @@ async def _stream_player(names: dict) -> None:
             _, nid, text = item
             buf = buffers.setdefault(nid, {"chunks": [], "ended": False, "header_shown": False})
             if nid == current:
-                print(text, end="", flush=True)
+                if not silent:
+                    print(text, end="", flush=True)
             else:
                 buf["chunks"].append(text)
                 if current is None:
@@ -170,12 +169,70 @@ async def _stream_round(app, msg, config, names: dict) -> dict:
     reset_stream()
     print(f"{C_GRAY}（思考中……）{C_RESET}", flush=True)
 
-    player = asyncio.create_task(_stream_player(names))
+    player = None
+    is_multi = False
+
     async for item in app.astream({"user_msg": msg}, config, stream_mode="updates"):
         for node_name, update in (item.items() if isinstance(item, dict) else []):
             if not isinstance(update, dict):
                 continue
+                
+            # 在流式事件中捕获准确的 active_targets 并启动播放器
+            if node_name == "record_input" and player is None:
+                targets = update.get("active_targets") or []
+                is_multi = len(targets) > 1
+                # 彻底关闭流式打印，交由下方全量输出，防止半截截断重复
+                player = asyncio.create_task(_stream_player(names, silent=True))
+            elif player is None:
+                # 如果走的是指令路径，同样静音
+                is_multi = False
+                player = asyncio.create_task(_stream_player(names, silent=True))
+            if node_name == "time_node":
+                ui_events = update.get("ui_events") or []
+                for ev in ui_events:
+                    if ev.get("type") == "pending_expired":
+                        print(f"\n{C_GRAY}【放弃】{ev.get('npc_name')} 最终没能做成（{ev.get('kind')}）{C_RESET}", flush=True)
+                    elif ev.get("type") == "npc_move":
+                        print(f"\n{C_GRAY}【系统】{ev.get('npc')} 悄悄去了 {ev.get('target_scene')}。{C_RESET}", flush=True)
+                continue
             if node_name == "npc_worker":
+                # 多并发时不打印单人台词，交由 narrator_node 统一打印
+                if not is_multi:
+                    hist = update.get("history") or []
+                    for e in hist:
+                        sp = e.get("speaker")
+                        content = e.get("content")
+                        if not content:
+                            continue
+                        if sp == "system":
+                            print(f"\n{C_GRAY}{content}{C_RESET}", flush=True)
+                        else:
+                            # 终端改为全量文本直出，彻底规避流式截断吞字
+                            npc_name = names.get(sp, sp)
+                            print(f"\n{C_YELLOW}[{npc_name}]{C_RESET} {content}", flush=True)
+                    
+                    ui_events = update.get("ui_events") or []
+                    for ev in ui_events:
+                        if ev.get("type") == "ripple":
+                            print(f"{C_GRAY}【余波】{ev.get('text')}{C_RESET}", flush=True)
+                        elif ev.get("type") == "show_options":
+                            opts = ev.get("options", [])
+                            if opts:
+                                print(f"\n{C_GREEN}【可快捷回复】{C_RESET} " + " | ".join(opts), flush=True)
+                continue
+            elif node_name == "arbiter_node":
+                hist = update.get("history") or []
+                for e in hist:
+                    if e.get("speaker") == "system" and e.get("content"):
+                        print(f"\n{C_GRAY}{e['content']}{C_RESET}", flush=True)
+                ui_events = update.get("ui_events") or []
+                for ev in ui_events:
+                    if ev.get("type") == "pending_set":
+                        print(f"\n{C_GRAY}【暗流】{ev.get('npc_name')} 想做点什么，但放弃了（{ev.get('reason')}）{C_RESET}", flush=True)
+                    elif ev.get("type") == "npc_move":
+                        print(f"\n{C_GRAY}【系统】{ev.get('npc')} 悄悄去了 {ev.get('target_scene')}。{C_RESET}", flush=True)
+                continue
+            elif node_name == "narrator_node":
                 hist = update.get("history") or []
                 for e in hist:
                     if e.get("speaker") == "system" and e.get("content"):
@@ -202,8 +259,21 @@ async def _stream_round(app, msg, config, names: dict) -> dict:
                 for e in hist:
                     if e.get("speaker") == "system" and e.get("content"):
                         print(f"\n{C_GRAY}{e['content']}{C_RESET}", flush=True)
-            elif node_name == "p2p_node" and update.get("p2p_transcript"):
-                print(f"\n{C_GRAY}【旁听】{C_RESET}{update['p2p_transcript']}", flush=True)
+            elif node_name == "p2p_node":
+                # 把 p2p_node 前置拦截的报错打印出来
+                hist = update.get("history") or []
+                for e in hist:
+                    if e.get("speaker") == "system" and e.get("content"):
+                        print(f"\n{C_GRAY}{e['content']}{C_RESET}", flush=True)
+                if update.get("p2p_transcript"):
+                    print(f"\n{C_GRAY}【旁听】{C_RESET}{update['p2p_transcript']}", flush=True)
+                ui_events = update.get("ui_events") or []
+                for ev in ui_events:
+                    if ev.get("type") == "pending_expired":
+                        print(f"\n{C_GRAY}【放弃】{ev.get('npc_name')} 最终没能做成（{ev.get('kind')}）{C_RESET}", flush=True)
+                    elif ev.get("type") == "npc_move":
+                        print(f"\n{C_GRAY}【系统】{ev.get('npc')} 悄悄去了 {ev.get('target_scene')}。{C_RESET}", flush=True)
+                continue
             elif node_name == "hint_node":
                 hist = update.get("history") or []
                 for e in hist:

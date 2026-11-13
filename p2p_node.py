@@ -11,8 +11,9 @@ from langchain_core.messages import HumanMessage
 
 from config import actor_llm
 from state import AgentState
-from memory import _compress, _compress_two
+from langchain_core.runnables import RunnableConfig
 from utils import time_advance, _format_attire
+from time_events import apply_time_events
 
 _P2P_RE = re.compile(
     r"(?:让|叫|请|麻烦|安排)?\s*"
@@ -61,148 +62,179 @@ def _role_block(info: dict, npc_id: str) -> str:
     if forbidden:
         cognition_parts.append(f"- 你极力隐瞒的事：\n{forbidden}")
     cognition_text = "\n".join(cognition_parts) if cognition_parts else "- 你是一个坦诚的人。"
-    mem = info.get("memory") or {}
-    if isinstance(mem, list):
-        long_mem = next((m.get("content", "") for m in mem if isinstance(m, dict) and m.get("type") == "summary_long"), None)
-        recent_mem = next((m.get("content", "") for m in mem if isinstance(m, dict) and m.get("type") == "summary_recent"), None)
-        chats = [m.get("content", "") for m in mem if isinstance(m, dict) and m.get("type") == "chat"]
-    else:
-        long_mem = mem.get("l3")
-        recent_mem = mem.get("l2")
-        chats = list(mem.get("l1") or [])
-    mem_lines = []
-    if long_mem:
-        mem_lines.append(f"[长期记忆] {long_mem}")
-    if recent_mem:
-        mem_lines.append(f"[近期记忆] {recent_mem}")
-    mem_lines.extend(chats)
-    mem_text = "\n".join(mem_lines) if mem_lines else "（你们之间还没有过接触）"
+    mem = info.get("memory") or {"l1": []}
+    chats = list(mem.get("l1") or [])
+    mem_text = "\n".join(chats) if chats else "（你们之间还没有过接触）"
     return (
         f"姓名：{name} | 身份：{info.get('role', '路人')}\n"
         f"性格：{info.get('personality', '普通')} | 外貌：{info.get('appearance', '普通')} | 衣着：{_format_attire(info.get('attire', {}))}\n"
         f"真实目标：{info.get('goal', '')}\n"
-        f"【认知状态】\n{cognition_text}\n"
-        f"【你的个人记忆】\n{mem_text}\n"
+        f"[认知状态]\n{cognition_text}\n"
+        f"[你的个人记忆]\n{mem_text}\n"
     )
 
 
-async def p2p_node(state: AgentState) -> dict:
+async def p2p_node(state: AgentState, config: RunnableConfig) -> dict:
+    thread_id = config.get("configurable", {}).get("thread_id", "") if isinstance(config, dict) else getattr(config, "configurable", {}).get("thread_id", "")
     msg = state.get("user_msg", "")
     npcs = state.get("npcs") or {}
     scene = state.get("current_scene", "未知")
 
-    a, b = parse_p2p(msg, npcs)
-    if not a or not b:
-        return {
-            "history": [{"speaker": "system",
-                         "content": "【系统】请用「@1和@2交流」这样的格式指定两个当前场景内的NPC交谈。"}],
-        }
+    bg_chat = state.get("bg_chat_targets")
+    is_bg = bool(bg_chat)
+    ui_events = []
 
-    info_a = npcs.get(a) or {}
-    info_b = npcs.get(b) or {}
-    if info_a.get("location") != scene or info_b.get("location") != scene:
-        absent = [info_b.get("name", b)] if info_a.get("location") == scene else \
-                 [info_a.get("name", a)] if info_b.get("location") == scene else \
-                 [info_a.get("name", a), info_b.get("name", b)]
-        return {
-            "history": [{"speaker": "system", "content": f"【系统】{'、'.join(absent)} 不在 {scene}，没法让他们在这里交谈。"}],
-        }
+    if is_bg:
+        a, b = bg_chat[0], bg_chat[1]
+        info_a = npcs.get(a) or {}
+        info_b = npcs.get(b) or {}
+        # 后台触发时，用前一次的历史动作/事件当话题，或者让模型自己找话
+        recent_events = "；".join((state.get("world_events") or [])[-2:])
+        topic = f"（你们在同一个房间内，没什么事发生。{recent_events}。请自然地和对方搭话，或者继续你们未说完的私密话题）"
+    else:
+        a, b = parse_p2p(msg, npcs)
+        if not a or not b:
+            return {
+                "history": [{"speaker": "system",
+                             "content": "【系统】请用「@1和@2交流」这样的格式指定两个当前场景内的NPC交谈。"}],
+            }
+        info_a = npcs.get(a) or {}
+        info_b = npcs.get(b) or {}
+        if info_a.get("location") != scene or info_b.get("location") != scene:
+            absent = [info_b.get("name", b)] if info_a.get("location") == scene else \
+                     [info_a.get("name", a)] if info_b.get("location") == scene else \
+                     [info_a.get("name", a), info_b.get("name", b)]
+            return {
+                "history": [{"speaker": "system", "content": f"【系统】{'、'.join(absent)} 不在 {scene}，没法让他们在这里交谈。"}],
+            }
+        topic = msg
 
     name_a = info_a.get("name", a)
     name_b = info_b.get("name", b)
+    if is_bg:
+        ui_events.append({"type": "npc_chat_start", "npc_ids": [a, b], "names": [name_a, name_b]})
 
-    attire_words = ("衣服", "服装", "服饰", "衣着", "穿着", "穿上", "脱掉", "脱下", "换衣", "换装",
-                    "打扮", "装束", "裙子", "衣衫", "光着", "赤裸", "外套", "外袍", "衬衫", "鞋袜")
-    if any(w in msg for w in attire_words):
-        locs_txt = "、".join(f"{i.get('name', '?')}(在{i.get('location', '?')}，穿{_format_attire(i.get('attire', {}))})"
-                             for i in npcs.values() if i.get("location") == scene) or "（无）"
-        locs_line = f"本场景在场NPC的位置与穿着：{locs_txt}\n"
-    else:
-        locs_line = ""
-
-    time_line = f"；当前时间：{state.get('time_phase')}" if state.get("time_phase") else ""
-
-    prompt_a = (
-        "你正在参与一场互动叙事扮演.此刻[玩家在旁观看],你与另一位NPC交谈.\n"
-        f"你所在场景:{scene}{time_line}.\n"
-        f"{_role_block(info_a, a)}\n"
-        f"[世界动态]\n"
-        f"玩家当前在:{scene}.\n"
-        f"{locs_line}"
-        f"最近世界事件:{(';'.join((state.get('world_events') or [])[-3:])) or '(无)'}\n\n"
-        f"你要主动和[{name_b}]攀谈,说符合你身份与关系的话(老朋友叙旧,试探,寒暄,提醒都可以),"
-        "开场说1至2句即可.若你与对方有秘密纠葛,可以旁敲侧击,甚至在对峙中说破对方的秘密,但不得说破你自己的核心秘密.\n"
-        "你知道玩家在场旁听,说话时会自然顾及这一点(是否避讳,是否故意说给玩家听,由你的身份与性格决定).\n"
-        "提到的地点或人物必须已在设定/世界动态中出现,不得编造.\n"
-        "你的认知状态里没有提到的名词/人物/概念,你不得承认自己知道,也不得猜测,只能表示没听过/不清楚.\n"
-        f"[你正在和{name_b}说话]\n"
-        "请以角色口吻回答,只输出你自己要说的话,不要代写对方.格式:(动作/神态) 说话内容,40至100字"
-    )   
-
-    a_talk, ok_a = await _npc_talk(prompt_a)
-    if not ok_a:
-        return {
-            "history": [{"speaker": "system", "content": f"【系统】{name_a}张了张嘴，终究没有说话。"}],
-        }
-
-    prompt_b = (
-        "你正在参与一场互动叙事扮演.此刻[玩家在旁观看],另一位NPC在和你说话.\n"
-        f"你所在场景:{scene}{time_line}.\n"
-        f"{_role_block(info_b, b)}\n"
-        f"[世界动态]\n"
-        f"玩家当前在:{scene}.\n"
-        f"{locs_line}"
-        f"最近世界事件:{(';'.join((state.get('world_events') or [])[-3:])) or '(无)'}\n\n"
-        f"[{name_a}对你说]\n{a_talk}\n\n"
-        "如果对方的话不符合你确知的事实，你可以表现出疑惑、反驳或纠正，而不是盲目附和.\n"
-        "请以你的身份回应对方:接住话头,回答问题或反问他,说话符合你的性格与立场.\n"
-        "如果对方提到你隐瞒的事,可以避重就轻或转移话题,但别直接说破.\n"
-        "你知道玩家在场旁听,回应时会自然顾及这一点(是否避讳,是否借机说给玩家听,由你的身份与性格决定).\n"
-        "提到的地点或人物必须已在设定/世界动态中出现,不得编造;你的认知状态里没有提到的名词,不得承认知道或猜测.\n"
-        "请以角色口吻回答.格式:`(动作/神态) 说话内容`,40至100字."
+    # 调用新建的 P2P 博弈执行器
+    from multi_party_chat import multi_party_chat
+    _chat_result = await multi_party_chat(
+        participants=[a, b],
+        topic=topic,
+        max_rounds=2, # 仅让 A 和 B 各说一句，避免刷屏
+        state=state
     )
     
-    b_talk, ok_b = await _npc_talk(prompt_b)
-    if not ok_b:
-        b_talk = "（沉默不语。）"
+    transcript = _chat_result.get("transcript", "")
+    memory_patches = _chat_result.get("memory_patches", {})
 
+    # 回写记忆
     npcs_patch = {}
-    for nid, self_talk, other_talk, other_name in (
-        (a, a_talk, b_talk, name_b),
-        (b, b_talk, a_talk, name_a),
-    ):
+    for nid, mem_entries in memory_patches.items():
+        if not mem_entries:
+            continue
         info = npcs.get(nid) or {}
-        mem = info.get("memory") or {"l1": [], "l2": None, "l3": None}
-        if not isinstance(mem, dict):
-            mem = {"l1": [], "l2": None, "l3": None}
+        mem = info.get("memory") or {"l1": []}
         l1 = list(mem.get("l1") or [])
-        l2 = mem.get("l2")
-        l3 = mem.get("l3")
-        entry = f"与{other_name}交谈：\n我：{self_talk}\n对方：{other_talk}"
+        
+        # 将当前轮次的对话作为一条整合记忆追加
+        entry = "\n".join(mem_entries)
         l1.append(entry)
-        old_l2 = l2
-        if len(l1) >= 8:
-            front = l1[:5]
-            l1 = l1[5:]
-            if l3 is None:
-                if old_l2 is not None:
-                    l3 = old_l2
-            else:
-                if old_l2:
-                    l3 = await _compress_two(old_l2, l3)
-            l2 = await _compress(front)
-        npcs_patch[nid] = {"memory": {"l1": l1, "l2": l2, "l3": l3}}
+        if len(l1) > 10:
+            l1 = l1[-10:]
+        npcs_patch[nid] = {"memory": {"l1": l1}}
+
+    # 如果是后台触发，彻底清理双方的所有 chat 意图，防止同一次对话被反复触发
+    if is_bg:
+        for _nid in [a, b]:
+            _info = npcs.get(_nid) or {}
+            _cleaned = [pi for pi in (_info.get("pending_intent") or []) if pi.get("kind") != "chat"]
+            npcs_patch.setdefault(_nid, {})["pending_intent"] = _cleaned
+
+    # 解析 transcript 为历史记录格式
+    history_msgs = []
+    for line in transcript.split("\n"):
+        if not line.strip():
+            continue
+        if line.startswith(f"{name_a}："):
+            _c = line.replace(f"{name_a}：", "", 1)
+            history_msgs.append({"speaker": a, "content": _c})
+            if is_bg: ui_events.append({"type": "npc_chat_line", "npc_id": a, "npc_name": name_a, "content": _c})
+        elif line.startswith(f"{name_b}："):
+            _c = line.replace(f"{name_b}：", "", 1)
+            history_msgs.append({"speaker": b, "content": _c})
+            if is_bg: ui_events.append({"type": "npc_chat_line", "npc_id": b, "npc_name": name_b, "content": _c})
+        else:
+            # 兜底：如果格式异常，直接丢给 A
+            history_msgs.append({"speaker": a, "content": line})
+            if is_bg: ui_events.append({"type": "npc_chat_line", "npc_id": a, "npc_name": name_a, "content": line})
+    
+    if is_bg:
+        ui_events.append({"type": "npc_chat_end", "npc_ids": [a, b]})
 
     out = {
-        "p2p_transcript": f"{name_a}说：{a_talk}；{name_b}说：{b_talk}",
+        "p2p_transcript": transcript,
         "world_events": [f"{name_a}和{name_b}在{scene}交谈"],
-        "history": [
-            {"speaker": a, "content": a_talk},
-            {"speaker": b, "content": b_talk},
-        ],
+        "history": history_msgs,
         "npcs": npcs_patch,
         "analysis_counter": int(state.get("analysis_counter") or 0) + 1,
         "run_story": True,
     }
-    out.update(time_advance(state))
+    if ui_events:
+        out["ui_events"] = ui_events
+    if is_bg:
+        out["bg_chat_targets"] = []
+    # 只有前台显式触发才推进时间，后台触发由 time_node 已经推进过了
+    if not is_bg:
+        _tp = time_advance(state)
+        if _tp:
+            _tp_hist = _tp.pop("history", None)
+            old_p = float(state.get("time_progress") or 0.0)
+            new_p = float(_tp.get("time_progress") or old_p)
+            _te = apply_time_events(state, old_p, new_p)
+            _te_hist = _te.pop("history", None) if _te else None
+            out.update(_tp)
+            if _te:
+                out.update(_te)
+            merged_hist = list(out.get("history") or [])
+            if _tp_hist:
+                merged_hist.extend(_tp_hist)
+            if _te_hist:
+                merged_hist.extend(_te_hist)
+            if merged_hist:
+                out["history"] = merged_hist
+
+            new_tick = int(state.get("world_tick") or 0) + 1
+            out["world_tick"] = new_tick
+            
+            from npc_life_tick import update_npc_life
+            _life = await update_npc_life(state, new_tick)
+            if _life:
+                _life_npcs = _life.pop("npcs", None)
+                out.update(_life)
+                if _life_npcs:
+                    out.setdefault("npcs", {}).update(_life_npcs)
+
+            # 消费未完成意图缓存
+            from utils import tick_pending
+            _pending = tick_pending({**state, "world_tick": new_tick})
+            if _pending:
+                _p_npcs = _pending.pop("npcs", None)
+                if _p_npcs:
+                    existing = out.setdefault("npcs", {})
+                    for _nid, _patch in _p_npcs.items():
+                        if _nid in existing and isinstance(existing[_nid], dict):
+                            existing[_nid] = {**existing[_nid], **_patch}
+                        else:
+                            existing[_nid] = _patch
+                if "ui_events" in _pending:
+                    out.setdefault("ui_events", []).extend(_pending["ui_events"])
+                if "world_events" in _pending:
+                    out.setdefault("world_events", []).extend(_pending["world_events"])
+    # 写入 RAG
+    try:
+        from rag_manager import add_npc_dialog
+        # 此时 transcript 里包含了双方的完整对话，直接作为整体记忆写入双方的 RAG
+        add_npc_dialog(thread_id, a, f"我与{name_b}交流的记录：\n{transcript}", {"scene": scene})
+        add_npc_dialog(thread_id, b, f"我与{name_a}交流的记录：\n{transcript}", {"scene": scene})
+    except Exception as e:
+        print(f"[RAG写入失败] {e}")
     return out

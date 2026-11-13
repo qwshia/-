@@ -162,6 +162,77 @@ async def item_node(state: AgentState) -> dict:
         _mode = "auto_open" if tr.get("auto_open") else "transfer"
         _land(name, tp, _mode)
 
+    npcs = state.get("npcs") or {}
+    player_gives = state.get("player_gives") or []
+    done_gives = list(state.get("processed_player_gives") or [])
+    for pg in player_gives:
+        _gname = pg.get("item")
+        _to_id = pg.get("to")
+        _sig = f"{pg.get('from')}::{_to_id}::{_gname}"
+        if not _gname or _sig in done_gives:
+            continue
+        done_gives.append(_sig)
+        if _gname not in _get_item_names(player_items):
+            continue
+        _to_info = npcs.get(_to_id) or {}
+        _to_name = _to_info.get("name", _to_id)
+        _to_loc = _to_info.get("location", "")
+        if _to_loc and _to_loc != scene:
+            sys_msgs.append(f"你不在 {_to_name} 附近，没法把「{_gname}」交给 TA。")
+            continue
+
+        # 缺口1：count-1，为 0 才移除
+        _found = None
+        for _it in player_items:
+            if isinstance(_it, dict) and str(_it.get("name", "")).strip() == _gname:
+                _found = _it
+                break
+            if not isinstance(_it, dict) and str(_it).strip() == _gname:
+                _found = _it
+                break
+        if _found is None:
+            sys_msgs.append(f"你身上没有「{_gname}」，无法交给{_to_name}。")
+            continue
+        _cnt = int(_found.get("count", 1)) if isinstance(_found, dict) else 1
+        _cnt -= 1
+        if _cnt <= 0:
+            player_items.remove(_found)
+        elif isinstance(_found, dict):
+            _found["count"] = _cnt
+
+        # 缺口2：复制 content / locked / key_name（若原 props 有，或 desc_map 里有 __content__）
+        _orig_prop = next((p for p in props if p.get("name") == _gname), None)
+        _gdesc = str(desc_map.get(_gname, "") or "")
+        props[:] = [p for p in props if p.get("name") != _gname]
+        _new_prop = {
+            "name": _gname,
+            "holder": _to_name,
+            "carried": True,
+            "location": _to_loc or scene,
+            "desc": _gdesc,
+        }
+        if _orig_prop:
+            for _k in ("content", "locked", "key_name"):
+                if _k in _orig_prop:
+                    _new_prop[_k] = _orig_prop[_k]
+        _c_key = f"__content__:{_gname}"
+        if _c_key in desc_map and "content" not in _new_prop:
+            try:
+                _raw = json.loads(desc_map[_c_key])
+                if isinstance(_raw, list) and _raw:
+                    _new_prop["content"] = _raw
+            except Exception:
+                pass
+        props.append(_new_prop)
+
+        # 缺口3：清 __agreed__ 前缀
+        for _k in list(desc_map.keys()):
+            if _k == f"__agreed__:{_gname}":
+                desc_map.pop(_k, None)
+
+        sys_msgs.append(f"「{_gname}」已交给{_to_name}。")
+        ui_events.append({"type": "item_given", "item": _gname, "to_npc": _to_name})  # 2D frontend
+
     msg = state.get("user_msg", "")
 
     steal_attempts = dict(state.get("steal_attempts") or {})
@@ -274,6 +345,7 @@ async def item_node(state: AgentState) -> dict:
         "props": props,
         "item_desc_map": desc_map,
         "processed_transfers": done,
+        "processed_player_gives": done_gives,
         "steal_attempts": steal_attempts,
     }
     if events:

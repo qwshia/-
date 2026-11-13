@@ -27,8 +27,11 @@ import re
 
 from state import AgentState, load_checkpointer
 from world import world_genesis
+from npc_genesis import npc_genesis
 from input_node import record_input, fan_out
 from npc_node import npc_worker
+from arbiter_node import arbiter_node
+from narrator_node import narrator_node
 from intent_node import intent_engine
 from action_node import action_engine
 from item_node import item_node, is_steal_cmd
@@ -37,6 +40,7 @@ from p2p_node import p2p_node, is_p2p
 from hint_node import hint_node
 from ending_node import judge_ending
 from utils import time_advance, phase_span, phase_display, time_step, is_scene_move_cmd
+from time_events import apply_time_events
 
 __all__ = ["build_graph", "load_checkpointer", "AgentState"]
 
@@ -69,12 +73,73 @@ def route_next(state: AgentState):
     return "record_input"
 
 
-def time_node(state: AgentState) -> dict:
-    """时间动态流逝：导演给定 time_turns（总交互轮数），把 time_start→time_limit 的档数
-    按轮数比例分摊，每轮推进一小步；轮数用尽（progress 走满全程）即到关键时间点。
-    导演未设时限（无 time_limit/time_turns）→ 时间固定不流逝。核心逻辑在 utils.time_advance，
-    p2p_node 复用同一函数保证每轮恰好推进一次（并行改造后不重复、不遗漏）。"""
-    return time_advance(state)
+async def time_node(state: AgentState) -> dict:
+    """时间推进 + world_tick 递增 + 时间事件执行。"""
+    out = {}
+    # 1. 无论是否有时间限制，世界步数必 +1
+    new_tick = int(state.get("world_tick") or 0) + 1
+    out["world_tick"] = new_tick
+
+    # 2. 原有时间推进逻辑
+    _tp = time_advance(state)
+    if _tp:
+        old_p = float(state.get("time_progress") or 0.0)
+        new_p = float(_tp.get("time_progress") or old_p)
+        _tp_hist = _tp.pop("history", None)
+        _te = apply_time_events(state, old_p, new_p)
+        _te_hist = _te.pop("history", None) if _te else None
+        out.update(_tp)
+        if _te:
+            out.update(_te)
+        merged_hist = list(out.get("history") or [])
+        if _tp_hist:
+            merged_hist.extend(_tp_hist)
+        if _te_hist:
+            merged_hist.extend(_te_hist)
+        if merged_hist:
+            out["history"] = merged_hist
+
+    # 3. 生活层更新
+    from npc_life_tick import update_npc_life
+    _life = await update_npc_life(state, new_tick)
+    if _life:
+        _life_npcs = _life.pop("npcs", None)
+        out.update(_life)
+        if _life_npcs:
+            out.setdefault("npcs", {}).update(_life_npcs)
+
+    # 4. 巡检：检查是否有 NPC 自主发起的 chat 意图
+    bg_chat = []
+    for nid, info in (state.get("npcs") or {}).items():
+        for pi in (info.get("pending_intent") or []):
+            if pi.get("kind") == "chat" and pi.get("remain", 0) <= 1:
+                target_name = pi.get("payload", "")
+                # 查找同场景的 target
+                for nid2, info2 in (state.get("npcs") or {}).items():
+                    if info2.get("name") == target_name and info2.get("location") == info.get("location") and nid != nid2:
+                        bg_chat.append([nid, nid2])
+                        break
+    if bg_chat:
+        out["bg_chat_targets"] = bg_chat[0] if bg_chat else []
+
+    # 5. 消费未完成意图缓存
+    from utils import tick_pending
+    _pending = tick_pending({**state, "world_tick": new_tick})
+    if _pending:
+        _p_npcs = _pending.pop("npcs", None)
+        if _p_npcs:
+            existing = out.setdefault("npcs", {})
+            for _nid, _patch in _p_npcs.items():
+                if _nid in existing and isinstance(existing[_nid], dict):
+                    existing[_nid] = {**existing[_nid], **_patch}
+                else:
+                    existing[_nid] = _patch
+        if "ui_events" in _pending:
+            out.setdefault("ui_events", []).extend(_pending["ui_events"])
+        if "world_events" in _pending:
+            out.setdefault("world_events", []).extend(_pending["world_events"])
+
+    return out
 
 
 def sync_status(state: AgentState) -> dict:
@@ -84,9 +149,12 @@ def sync_status(state: AgentState) -> dict:
 def build_graph(checkpointer=None):
     g = StateGraph(AgentState)
     g.add_node("world_genesis", world_genesis)
+    g.add_node("npc_genesis", npc_genesis)
     g.add_node("record_input", record_input)
     g.add_node("intent_engine", intent_engine)
     g.add_node("npc_worker", npc_worker)
+    g.add_node("narrator_node", narrator_node)
+    g.add_node("arbiter_node", arbiter_node)
     g.add_node("action_engine", action_engine)
     g.add_node("item_node", item_node)
     g.add_node("story_keeper", story_keeper)
@@ -109,7 +177,8 @@ def build_graph(checkpointer=None):
         },
     )
 
-    g.add_edge("world_genesis", "sync_status")
+    g.add_edge("world_genesis", "npc_genesis")
+    g.add_edge("npc_genesis", "sync_status")
 
     g.add_conditional_edges(
         "record_input",
@@ -120,10 +189,16 @@ def build_graph(checkpointer=None):
         "intent_engine", fan_out,
         {"sync_status": "sync_status"},
     )
-    g.add_edge("npc_worker", "item_node")
+    g.add_edge("npc_worker", "narrator_node")
+    g.add_edge("narrator_node", "arbiter_node")
+    g.add_edge("arbiter_node", "item_node")
     g.add_edge("action_engine", "item_node")
     g.add_edge("item_node", "time_node")
-    g.add_edge("time_node", "sync_status")
+    g.add_conditional_edges(
+        "time_node", 
+        lambda s: "p2p_node" if s.get("bg_chat_targets") else "sync_status",
+        {"p2p_node": "p2p_node", "sync_status": "sync_status"},
+    )
     g.add_conditional_edges(
         "sync_status", lambda s: "story_keeper" if s.get("run_story") else "end",
         {"story_keeper": "story_keeper", "end": END},

@@ -24,12 +24,20 @@ def _match_avail(target: str, avail: list) -> str | None:
     target = (target or "").strip(" ，,、")
     if not target:
         return None
-    hit = next((s for s in avail if s == target or target in s or s in target), None)
-    if hit is None and ("门" in target or "房门" in target):
+    if target in avail:
+        return target
+    for s in sorted(avail, key=len, reverse=True):
+        if target in s or s in target:
+            return s
+    if "门" in target or "房门" in target:
         t2 = target.replace("房门", "").replace("门", "").strip()
         if t2:
-            hit = next((s for s in avail if s == t2 or t2 in s or s in t2), None)
-    return hit
+            if t2 in avail:
+                return t2
+            for s in sorted(avail, key=len, reverse=True):
+                if t2 in s or s in t2:
+                    return s
+    return None
 
 
 async def action_engine(state: AgentState) -> dict:
@@ -73,6 +81,9 @@ async def action_engine(state: AgentState) -> dict:
                 ui_events.append({"type": "scene_transition", "from_scene": scene, "to_scene": hit, "motion": "walk"})  # 2D frontend
                 prefix = "门已打开，" if hit in opened else "你推开门，"
                 sys_replies.append(f"{prefix}来到了 {hit}。")
+                _scene_desc = str((scenes.get(hit) or {}).get("desc", "") or "").strip()
+                if _scene_desc:
+                    sys_replies.append(_scene_desc)
         else:
             sys_replies.append(f"这里没有叫 {target} 的地方。可去：{'、'.join(avail) or '（无）'}")
 
@@ -94,8 +105,14 @@ async def action_engine(state: AgentState) -> dict:
                     "history": [{"speaker": "system", "content": f"【系统】{' '.join(sys_replies)}"}],
                 }
             
-            # 背包物品直接调查（不依赖场景/ props 候选）
+# 背包物品直接调查（不依赖场景/ props 候选）
             if loc in _get_item_names(new_items):
+                # 兼容从场景/父容器捡起的物品：如果 player_items 里有 content 字段，但 desc_map 里没占位符，则动态补充
+                _target_item = next((it for it in new_items if (it.get("name") if isinstance(it, dict) else it) == loc), None)
+                if isinstance(_target_item, dict) and _target_item.get("content"):
+                    if f"__content__:{loc}" not in desc_map:
+                        desc_map[f"__content__:{loc}"] = json.dumps(_parse_content(_target_item.get("content")), ensure_ascii=False)
+
                 _d = str(desc_map.get(loc, "") or "")
                 if "（锁着，需要" in _d:
                     _m = re.search(r"（锁着，需要(.+?)）", _d)
@@ -105,7 +122,7 @@ async def action_engine(state: AgentState) -> dict:
                         sys_replies.append(f"「{loc}」还缺{'、'.join(_missing)}才能打开。")
                     else:
                         _subs = handle_container_open(loc, desc_map, props, new_items, scenes)
-                        ui_events.append({"type": "container_opened", "container": loc, "revealed_items": list(_subs)})  # 2D frontend
+                        ui_events.append({"type": "container_opened", "container": loc, "revealed_items": list(_subs)})
                         sys_replies.append(f"你打开了「{loc}」，子物品是：{'、'.join(_subs) or '（空）'}。")
                 elif f"__agreed__:{loc}" in desc_map:
                     _m = re.search(r"还缺(.+?)(?:）|$)", _d)
@@ -116,8 +133,13 @@ async def action_engine(state: AgentState) -> dict:
                         sys_replies.append(f"「{loc}」还缺{'、'.join(_missing)}才能打开。")
                     else:
                         _subs = handle_container_open(loc, desc_map, props, new_items, scenes)
-                        ui_events.append({"type": "container_opened", "container": loc, "revealed_items": list(_subs)})  # 2D frontend
+                        ui_events.append({"type": "container_opened", "container": loc, "revealed_items": list(_subs)})
                         sys_replies.append(f"你打开了「{loc}」，子物品是：{'、'.join(_subs) or '（空）'}。")
+                elif f"__content__:{loc}" in desc_map:
+                    # 未锁容器：在背包内直接展开
+                    _subs = handle_container_open(loc, desc_map, props, new_items, scenes)
+                    ui_events.append({"type": "container_opened", "container": loc, "revealed_items": list(_subs)})
+                    sys_replies.append(f"你打开了「{loc}」，子物品是：{'、'.join(_subs) or '（空）'}。")
                 else:
                     sys_replies.append(f"「{loc}」：{_d or '用途不明'}")
                 return {
@@ -149,7 +171,7 @@ async def action_engine(state: AgentState) -> dict:
         s_items = sdef.get("items", []) if isinstance(sdef.get("items"), list) else []
 
         def _loc_match(loc, sc):
-            return bool(loc) and (loc == sc or loc in sc or sc in loc)
+            return bool(loc) and loc == sc
 
         cand = [(it, False) for it in s_items if isinstance(it, dict) and it.get("name")]
         for p in props:
@@ -179,13 +201,10 @@ async def action_engine(state: AgentState) -> dict:
                 # 全场景调查
                 found_any = False
                 for it, is_prop in sel:
-                    if key_owner_npc(it.get("name", ""), props) and not it.get("content") and not it.get("locked"):
-                        continue
                     it_name = it["name"]
                     if it_name in _get_item_names(new_items):
                         continue
                     desc = str(it.get("desc", "") or "").strip()
-                    desc_txt = desc.rstrip("。. ")
                     if not is_prop:
                         it = dict(it)
                         it["location"] = scene
@@ -291,14 +310,18 @@ async def action_engine(state: AgentState) -> dict:
                                             _d0 = str(_it.get("desc", "") or "")
                                             if "内部" in _d0:
                                                 _it["desc"] = ""
-                            sys_replies.append(f"你发现了「{it_name}」：{desc_txt}。它锁着，还缺{detail}才能打开。")
+                            sys_replies.append(f"你发现了「{it_name}」，它锁着，还缺{detail}才能打开。")
                             found_any = True
                             
                     elif status == "npc_present":
+                        # 如果已经在当前场景，且该物品是开启此场景的钥匙，则跳过提示
+                        is_key_for_current = it_name in _need_keys(scenes.get(scene, {}))
+                        if is_key_for_current:
+                            continue
                         if it.get("carried"):
                             sys_replies.append(f"「{it_name}」在{detail}身上（随身携带），需要向 TA 索要或偷取。")
                         else:
-                            sys_replies.append(f"「{it_name}」在{detail}身上，需先支开他，或尝试偷取。")
+                            sys_replies.append(f"「{it_name}」在场景中，但{detail}正在旁边盯着，你需要先支开 TA，或尝试偷取。")
                         found_any = True
                     elif status == "unknown":
                         sys_replies.append(detail if detail else f"这里没有 {it_name}。")
@@ -318,7 +341,6 @@ async def action_engine(state: AgentState) -> dict:
                         it["carried"] = False
                     it_name = it["name"]
                     desc = str(it.get("desc", "") or "").strip()
-                    desc_txt = desc.rstrip("。. ")
                     parsed_content = _parse_content(it.get("content"))
                     
                     if it_name in _get_item_names(new_items) and "（锁着，需要" not in str(desc_map.get(it_name, "")):
@@ -453,14 +475,14 @@ async def action_engine(state: AgentState) -> dict:
                                             _d0 = str(_it.get("desc", "") or "")
                                             if "内部" in _d0:
                                                 _it["desc"] = ""
-                            sys_replies.append(f"你发现了「{it_name}」：{desc_txt}。它锁着，还缺{detail}才能打开。")
+                            sys_replies.append(f"你发现了「{it_name}」，它锁着，还缺{detail}才能打开。")
                             found_any = True
                             
                     elif status == "npc_present":
                         if it.get("carried"):
                             sys_replies.append(f"「{it_name}」在{detail}身上（随身携带），需要向 TA 索要或偷取。")
                         else:
-                            sys_replies.append(f"「{it_name}」在{detail}身上，需先支开他，或尝试偷取。")
+                            sys_replies.append(f"「{it_name}」在场景中，但{detail}正在旁边盯着，你需要先支开 TA，或尝试偷取。")
                         found_any = True
                     elif status == "unknown":
                         sys_replies.append(detail if detail else f"这里没有 {it_name}。")

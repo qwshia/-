@@ -18,8 +18,8 @@ _ITEM_REQ_PAT = [
 ]
 
 _MOVE_PAT = [
-    re.compile(r"(?:让|叫|请)?\s*@(?:子|npc_)?\d*\s*(?:去|前往|走到|来到|移动到)\s*([\u4e00-\u9fa5A-Za-z0-9（）()]{1,12})"),
-    re.compile(r"(?:去|前往|走到|来到|移动到)\s*([\u4e00-\u9fa5A-Za-z0-9（）()]{1,12})"),
+    re.compile(r"(?:让|叫|请)?\s*@(?:子|npc_)?\d*\s*(?:去|前往|走到|移动到)\s*([\u4e00-\u9fa5A-Za-z0-9（）()]{1,12})"),
+    re.compile(r"(?:去|前往|走到|移动到)\s*([\u4e00-\u9fa5A-Za-z0-9（）()]{1,12})"),
 ]
 
 
@@ -73,6 +73,46 @@ def _parse_item_request(msg: str, props: list, holder_name: str) -> str | None:
     return None
 
 
+def _parse_player_give(msg: str, player_items: list) -> str | None:
+    """玩家把背包物品交给当前 NPC。协议：!@N 给 X（前端拖拽拼出）。
+    也兼容自然语言「把 X 给你」「给你 X」「X 给你」。
+    「给我」「给我 X」不算（那是 NPC→玩家的 give_item）。返回匹配到的背包物品名，未匹配返回 None。"""
+    if not msg:
+        return None
+    items = [str(x) for x in (player_items or []) if x]
+    if not items:
+        return None
+    text = msg.strip()
+    has_gei_wo = bool(re.search(r"(?:给|交给|递给|送)\s*我", text))
+    has_gei_npc = bool(re.search(r"(?:给|交给|递给|送)\s*(?:你|您|ta|TA|她|他)", text))
+    if has_gei_wo and not has_gei_npc:
+        return None
+
+    cands = []
+    m = re.match(r"^(?:给|交给|递给|送)\s*([\u4e00-\u9fa5A-Za-z0-9（）()]{1,12})\s*$", text)
+    if m:
+        cands.append(m.group(1).strip(_ATTIRE_STRIP))
+    m = re.search(r"(?:把|将)\s*([\u4e00-\u9fa5A-Za-z0-9（）()]{1,12})\s*(?:给|交给|递给|送)\s*(?:你|您|ta|TA|她|他)", text)
+    if m:
+        cands.append(m.group(1).strip(_ATTIRE_STRIP))
+    m = re.search(r"(?:给|交给|递给|送)\s*(?:你|您|ta|TA|她|他)\s*([\u4e00-\u9fa5A-Za-z0-9（）()]{1,12})", text)
+    if m:
+        cands.append(m.group(1).strip(_ATTIRE_STRIP))
+    m = re.search(r"([\u4e00-\u9fa5A-Za-z0-9（）()]{1,12})\s*(?:给|交给|递给|送)\s*(?:你|您|ta|TA|她|他)", text)
+    if m:
+        cands.append(m.group(1).strip(_ATTIRE_STRIP))
+
+    for cand in cands:
+        if not cand:
+            continue
+        if cand in items:
+            return cand
+        for it in items:
+            if cand in it or it in cand:
+                return it
+    return None
+
+
 def _parse_npc_move(msg: str, avail: list) -> str | None:
     for pat in _MOVE_PAT:
         m = pat.search(msg)
@@ -81,6 +121,43 @@ def _parse_npc_move(msg: str, avail: list) -> str | None:
             for s in avail:
                 if cand == s or cand in s or s in cand:
                     return s
+    return None
+def _parse_player_give(msg: str, player_items: list) -> str | None:
+    """玩家把背包物品交给当前 NPC。协议：!@N 给 X（前端拖拽拼出）。
+    兼容「把 X 给你」「给你 X」「X 给你」；「给我」「给我 X」不算（那是反向 give_item）。返回背包中匹配到的物品名；未匹配返回 None。"""
+    if not msg:
+        return None
+    items = [str(x) for x in (player_items or []) if x]
+    if not items:
+        return None
+    text = msg.strip()
+    has_gei_wo = bool(re.search(r"(?:给|交给|递给|送)\s*我", text))
+    has_gei_npc = bool(re.search(r"(?:给|交给|递给|送)\s*(?:你|您|ta|TA|她|他)", text))
+    if has_gei_wo and not has_gei_npc:
+        return None
+
+    cands = []
+    m = re.match(r"^(?:给|交给|递给|送)\s*([\u4e00-\u9fa5A-Za-z0-9（）()]{1,12})\s*$", text)
+    if m:
+        cands.append(m.group(1).strip(_ATTIRE_STRIP))
+    m = re.search(r"(?:把|将)\s*([\u4e00-\u9fa5A-Za-z0-9（）()]{1,12})\s*(?:给|交给|递给|送)\s*(?:你|您|ta|TA|她|他)", text)
+    if m:
+        cands.append(m.group(1).strip(_ATTIRE_STRIP))
+    m = re.search(r"(?:给|交给|递给|送)\s*(?:你|您|ta|TA|她|他)\s*([\u4e00-\u9fa5A-Za-z0-9（）()]{1,12})", text)
+    if m:
+        cands.append(m.group(1).strip(_ATTIRE_STRIP))
+    m = re.search(r"([\u4e00-\u9fa5A-Za-z0-9（）()]{1,12})\s*(?:给|交给|递给|送)\s*(?:你|您|ta|TA|她|他)", text)
+    if m:
+        cands.append(m.group(1).strip(_ATTIRE_STRIP))
+
+    for cand in cands:
+        if not cand:
+            continue
+        if cand in items:
+            return cand
+        for it in items:
+            if cand in it or it in cand:
+                return it
     return None
 
 

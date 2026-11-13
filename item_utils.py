@@ -90,7 +90,7 @@ def can_acquire(p, npcs, player_items, props, current_scene):
         if holder_scene == current_scene:
             return ("npc_present", holder)
         else:
-            return ("free", "")
+            return ("unknown", f"不在当前场景（{holder_scene}）")
     # 第三步：scene
     if loc.startswith("scene:"):
         scene_name = loc[6:]

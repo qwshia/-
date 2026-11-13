@@ -49,10 +49,18 @@ def record_input(state: AgentState) -> dict:
 
 
 def fan_out(state: AgentState):
-    """动态并发：Send 唤醒所有在场 NPC；无人时直接收尾"""
+    """动态并发：唤醒所有在场 NPC（主目标与非目标旁观者）"""
     targets = state.get("active_targets") or []
-    if not targets:
+    scene = state.get("current_scene", "")
+    npcs = state.get("npcs") or {}
+    
+    # 找出所有在当前场景的 NPC
+    present = [nid for nid, info in npcs.items() if info.get("location") == scene]
+    
+    # 如果场上一个人都没有，直接收尾
+    if not present:
         return "sync_status"
+        
     snapshot = {
         "npcs": state.get("npcs"),
         "current_scene": state.get("current_scene"),
@@ -79,5 +87,11 @@ def fan_out(state: AgentState):
         "analysis_counter": state.get("analysis_counter", 0),
         "last_clue_idx": state.get("last_clue_idx", 0),
     }
-    sends = [Send("npc_worker", {"npc_id": t, **snapshot}) for t in targets]
+    
+    sends = []
+    for nid in present:
+        # 判断是否为玩家直接互动对象
+        is_observer = nid not in targets
+        sends.append(Send("npc_worker", {"npc_id": nid, "is_observer": is_observer, **snapshot}))
+        
     return sends

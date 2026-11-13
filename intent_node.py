@@ -1,10 +1,6 @@
 """意图识别节点：@N 单人对话 → player_intent。规则优先，模型兜底。"""
-import json
 import re
 
-from langchain_core.messages import HumanMessage
-
-from config import intent_llm
 from state import AgentState
 from utils import _get_item_names
 
@@ -12,6 +8,7 @@ from parsing import (
     _parse_attire_change,
     _parse_item_request,
     _parse_npc_move,
+    _parse_player_give,
     _is_npc_command,
 )
 
@@ -66,137 +63,150 @@ async def intent_engine(state: AgentState) -> dict:
             "clean_msg": clean_msg, "source": "question_block",
         }}
 
-    # 规则层
-    hits = []
-    command = None
-    if _is_npc_command(user_msg):
-        attire = _parse_attire_change(clean_msg)
-        item = _parse_item_request(clean_msg, props, target_name)
+    # 规则层优先（无论是否带 !@N）
+    give_to_npc = _parse_player_give(clean_msg, player_items)
+    attire = _parse_attire_change(clean_msg)
+    item = _parse_item_request(clean_msg, props, target_name)
+    if any(w in clean_msg for w in ("去", "前往", "走到", "移动到")):
         move = _parse_npc_move(clean_msg, available_scenes)
-        if attire:
-            action, it = attire
-            command = {"type": "wear", "item": [it], "scene": None, "action": action}
-            hits.append(attire)
-        elif item:
-            command = {"type": "give_item", "item": [item], "scene": None, "action": None}
-            hits.append(item)
-        elif move:
-            command = {"type": "move", "item": None, "scene": move, "action": None}
-            hits.append(move)
+    else:
+        move = None
 
-    if command is not None:
-        residual = _rule_residual(clean_msg, hits)
-        intent_type = "mixed" if residual else "command"
+    if give_to_npc:
         return {"player_intent": {
-            "intent_type": intent_type, "command": command,
+            "intent_type": "command",
+            "command": {"type": "give_to_npc", "item": [give_to_npc], "scene": None, "action": None},
+            "clean_msg": clean_msg, "source": "rule",
+        }}
+    if attire:
+        action, it = attire
+        return {"player_intent": {
+            "intent_type": "command",
+            "command": {"type": "wear", "item": [it], "scene": None, "action": action},
+            "clean_msg": clean_msg, "source": "rule",
+        }}
+    if item:
+        if item not in (set(player_items) | {p.get("name") for p in props if p.get("name")}):
+            return {"player_intent": {
+                "intent_type": "chat", "command": None,
+                "clean_msg": clean_msg, "source": "whitelist_block",
+            }}
+        return {"player_intent": {
+            "intent_type": "command",
+            "command": {"type": "give_item", "item": [item], "scene": None, "action": None},
+            "clean_msg": clean_msg, "source": "rule",
+        }}
+    if move:
+        return {"player_intent": {
+            "intent_type": "command",
+            "command": {"type": "move", "item": None, "scene": move, "action": None},
             "clean_msg": clean_msg, "source": "rule",
         }}
 
-    # 模型兜底
+    # 如果是显式指令 (!@N) 但规则层未命中 → 直接归为 chat，不走 LLM
+    if _is_npc_command(user_msg):
+        return {"player_intent": {
+            "intent_type": "chat", "command": None,
+            "clean_msg": clean_msg, "source": "rule_miss",
+        }}
+
+    # ================= 缩水版 LLM 兜底 =================
+    from langchain_core.messages import HumanMessage
+    from config import intent_llm
+    import json
+
     npc_items_txt = "、".join(
         p.get("name", "") for p in props if p.get("holder") == target_name and p.get("name")
     ) or "（无）"
+    _all_valid_items = list(set(player_items) | {p.get("name") for p in props if p.get("name")})
+    items_txt = "、".join(_all_valid_items) or "（无）"
+
     prompt = (
-        "你是意图识别器。根据玩家对 NPC 说的话，判断意图类型。\n"
+        "你是意图提取器。判断玩家对 NPC 说的话里，是否包含【极度明确】的指令。\n"
         "只输出严格 JSON，不要任何额外文字，格式：\n"
-        '{"intent_type": "chat|command|mixed", "command": {"type": "wear|move|give_item", '
+        '{"intent_type": "chat|command", "command": {"type": "give_item|give_to_npc|wear|move", '
         '"item": ["物品名"] 或 null, "scene": "场景名或null", "action": "put_on|take_off|null"}}\n'
-         "根据玩家意图判断，如果玩家试图让NPC行动、索要物品、脱衣，或者让NPC去某地，输出 command。\n"
-        "item 必须是数组：give_item 的 item 为物品名列表；wear 若玩家说把衣服全脱了，item 必须是 [\"全部\"]。\n"
-        "若玩家提到多个物品/衣物（用“和/与/跟”并列），必须拆成数组的多个元素，不能合并成一句。\n"
-"询问“在哪/在哪里/位置”一律属于 chat，禁止输出 give_item。\n"
-"针对 wear 指令：如果玩家要求脱衣服，请结合该 NPC 的 [当前衣服字典]，精准提取要脱掉的衣服槽位键名（如'外套'、'鞋履'），直接输出在 item 数组里。不要输出玩家原话里的别名。\n"        f"当前场景：{scene}\n"
-        f"可去场景：{'、'.join(available_scenes) or '（无）'}\n"
-        f"玩家背包：{'、'.join(player_items) or '（空）'}\n"
-        f"该 NPC 身上物品：{npc_items_txt}\n"
-        f"玩家说：{clean_msg}\n"
-        "若无明确指令则 intent_type=chat 且 command=null。"
+        "【严格限制】\n"
+        "1. 玩家必须明确提到了【具体物品名】或【具体场景名】。\n"
+        "2. 如果玩家表达模糊（如“给我吧”、“配和工作”），或者你无法确定具体物品名/场景名，必须输出 chat，command 为 null。\n"
+        "3. give_item（玩家索要 NPC 的物品）：玩家明确说“给我 X / 把 X 拿来”。\n"
+        "4. give_to_npc（玩家给 NPC 物品）：玩家明确说“给你 X / 把 X 交给你”。\n"
+        "5. wear（穿/脱）：玩家明确说“穿上 X / 脱下 X”。\n"
+        "6. move（移动）：玩家明确说“去 X”。\n"
+        f"当前场景:{scene}\n"
+        f"可去场景:{'、'.join(available_scenes) or '(无)'}\n"
+        f"该 NPC 身上物品:{npc_items_txt}\n"
+        f"场景及背包所有物品:{items_txt}\n"
+        f"玩家说:{clean_msg}\n"
     )
     try:
         resp = await intent_llm.ainvoke([HumanMessage(content=prompt)])
         raw = resp.content if isinstance(resp.content, str) else str(resp.content)
+        m = re.search(r"\{.*\}", raw, re.S)
+        data = json.loads(m.group(0)) if m else {}
     except Exception:
-        return {"player_intent": {
-            "intent_type": "chat", "command": None,
-            "clean_msg": clean_msg, "source": "fallback",
-        }}
-
-    m = re.search(r"\{.*\}", raw, re.S)
-    if not m:
-        return {"player_intent": {
-            "intent_type": "chat", "command": None,
-            "clean_msg": clean_msg, "source": "fallback",
-        }}
-    try:
-        data = json.loads(m.group(0))
-    except Exception:
-        return {"player_intent": {
-            "intent_type": "chat", "command": None,
-            "clean_msg": clean_msg, "source": "fallback",
-        }}
+        data = {}
 
     intent_type = data.get("intent_type", "chat")
-    if intent_type not in ("chat", "command", "mixed"):
-        intent_type = "chat"
+    if intent_type != "command":
+        return {"player_intent": {
+            "intent_type": "chat", "command": None,
+            "clean_msg": clean_msg, "source": "llm_fallback",
+        }}
+
     command = data.get("command")
     if not isinstance(command, dict):
         command = None
     source = "llm"
-    # 规范化类型别名
+
     _TYPE_ALIAS = {
-        "attire": "wear", "attire_change": "wear", "player_wear": None, "player_attire": None,
-        "self_attire": None, "item": "give_item", "give": "give_item", "go": "move",
+        "attire": "wear", "attire_change": "wear",
+        "item": "give_item", "give": "give_item", "go": "move",
+        "give_to_npc": "give_to_npc", "player_give": "give_to_npc",
     }
-    allowed_types = {"wear", "give_item", "move"}
+    allowed_types = {"wear", "give_item", "move", "give_to_npc"}
 
     if command is not None:
         ctype = command.get("type")
         if ctype in _TYPE_ALIAS:
-            mapped = _TYPE_ALIAS[ctype]
-            if mapped is None:
-                command = None
-                intent_type = "chat"
-            else:
-                command["type"] = mapped
-                ctype = mapped
-        citem = command.get("item") if isinstance(command, dict) else None
-        # 数据兜底：强制转为列表
+            command["type"] = _TYPE_ALIAS[ctype]
+            ctype = command["type"]
+
+        citem = command.get("item")
         if isinstance(citem, str):
             citem = [citem]
-        elif isinstance(citem, list):
-            citem = [str(x) for x in citem if x is not None]
-        elif citem is None:
-            if ctype in ("wear", "give_item"):
-                citem = []
-            else:
-                citem = None
-        if isinstance(command, dict):
-            command["item"] = citem
-        scen = command.get("scene") if isinstance(command, dict) else None
-        if command is not None and ctype not in allowed_types:
+        elif not isinstance(citem, list):
+            citem = []
+        citem = [str(x).strip() for x in citem if x is not None]
+
+        scen = command.get("scene")
+        
+        if ctype not in allowed_types:
             command = None
             intent_type = "chat"
-        # 硬性拦截自换装
-        if command is not None and command.get("type") in ("self_attire", "player_wear", "player_attire"):
+        elif ctype in ("wear", "give_item", "give_to_npc") and not citem:
             command = None
             intent_type = "chat"
-        all_items = set(player_items) | {p.get("name") for p in props if p.get("name")}
+        elif ctype == "move" and scen not in available_scenes:
+            command = None
+            intent_type = "chat"
+
+        # 物品白名单拦截（极其重要：防止“配和工作”当物品）
+        _valid_items = set(player_items) | {p.get("name") for p in props if p.get("name")}
         npc_private = state.get("npc_private_items") or {}
         for v in npc_private.values():
             if isinstance(v, (list, tuple)):
-                all_items.update(str(x) for x in v)
-        if command is not None and command.get("type") == "give_item" and isinstance(citem, list):
+                _valid_items.update(str(x) for x in v)
+
+        if command is not None and ctype in ("give_item", "give_to_npc"):
             _before = list(citem)
-            citem = [i for i in citem if i in all_items]
+            citem = [i for i in citem if i in _valid_items]
             if _before and not citem:
                 command = None
                 intent_type = "chat"
                 source = "whitelist_block"
-            elif isinstance(command, dict):
+            else:
                 command["item"] = citem
-        if command is not None and command.get("type") == "move" and scen is not None and scen not in available_scenes:
-            command = None
-            intent_type = "chat"
 
     if intent_type == "chat":
         command = None

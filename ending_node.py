@@ -22,8 +22,7 @@ async def judge_ending(state: AgentState) -> dict:
                          "content": "【系统】你似乎想下结论，但还没说出完整的推理。把你掌握的线索和你的怀疑说清楚。"}],
         }
 
-    stepped = time_step(state)
-    effective_progress = float(stepped.get("time_progress") or state.get("time_progress") or 0.0)
+    effective_progress = float(state.get("time_progress") or 0.0)
 
     if time_is_up(state.get("time_start", "清晨"), state.get("time_limit", ""), effective_progress):
         limit = state.get("time_limit", "")

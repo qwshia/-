@@ -47,11 +47,15 @@ class AgentState(TypedDict):
     allowed_entities: List[str]
     available_scenes: List[str]
     scenes: Dict[str, dict]                         # {场景名: {desc, items:[{name,desc,locked?}], requires_key?}} 调查用
-    npcs: Annotated[Dict[str, dict], merge_npc]     # 实体库：固定字段 + 动态字段，Reducer 合并
+    npcs: Annotated[Dict[str, dict], merge_npc]     # 实体库：固定字段 + 动态字段（含 emotion_tags/pending_intent），Reducer 合并
     props: List[dict]                               # 重要物品归属表（全剧统一认知，NPC 不得编造位置）
     time_start: str                                 # 开局时间档（如"清晨"）
     time_limit: str                                 # 关键时间点（如"黄昏"），可空=不限时
-    time_turns: int                                 # 从 time_start 到 time_limit 的预计交互轮数（导演给定）
+    time_turns: int                                 # 废弃字段（5轮一档后不再使用），保留以兼容老 checkpoint
+    time_progress: float                            # 已推进的档位数（每轮 +0.2，5轮一档）
+    world_tick: int                                 # 世界时钟：玩家每步（对话/指令/移动/调查/偷窃/p2p）+1，驱动 npc_life_tick 触发
+    timed_events: List[dict]                        # 导演生成的时间事件（按 at_phase 触发，每场景最多一个）
+    fired_time_events: Annotated[List[str], merge_list_union]  # 已触发的事件 id（防重复）
 
     current_scene: str
     time_phase: str                                 # 当前时间档（按轮数比例动态推进）；无时间压力时为空
@@ -62,6 +66,8 @@ class AgentState(TypedDict):
     item_desc_map: Dict[str, str]                   # 道具用途表（导演初始从场景汇总，动态获得由 item_node 补充）
     item_transfers: Annotated[List[dict], operator.add]  # NPC 同意给予的物品（reducer 收集，item_node 消费）
     processed_transfers: List[str]                  # 已消费的给予指纹（防 reducer 累积重复处理）
+    player_gives: Annotated[List[dict], operator.add]  # 玩家同意交给 NPC 的物品（npc_worker 收集，item_node 消费）
+    processed_player_gives: List[str]               # 已消费的玩家给予指纹（防重复处理）
     analysis_counter: int                           # 判定官节奏计数（仅对话轮递增，指令不计数）
     last_clue_idx: int                              # 上次线索分析时 history 的长度（窗口起点）
     player_revealed_clues: Annotated[List[str], operator.add]
@@ -78,7 +84,10 @@ class AgentState(TypedDict):
     history: Annotated[List[dict], operator.add]
 
     p2p_transcript: str                             # 本轮 NPC 间交谈全文
+    npc_converged: bool                             # 本轮是否触发了群像收敛
     run_story: bool                                 # 本轮是否触发线索提取
+    bg_chat_targets: List[str]                      # 本轮后台触发的 NPC 自主对话参与者 [npc_a, npc_b]
+    last_player_action: dict                        # 玩家上一轮的物理动作（如：{"action": "investigate", "target": "急救箱", "scene": "书房"}）
     opened_scenes: Annotated[List[str], merge_list_union]  # 已打开的门禁场景
 
 
