@@ -4,3 +4,14 @@ langchain-core==1.6.12
 langchain-openai==1.7.2
 langgraph-checkpoint-sqlite==3.1.2
 python-dotenv
+
+# RAG 记忆（world_genesis / npc_worker 依赖，缺失会导致 main.py import 阶段崩溃）
+chromadb==1.5.9
+langchain-huggingface==1.2.3
+
+# SQLite checkpoint（config.py 有 try 兜底，缺失会静默降级为内存存储，存档丢失）
+aiosqlite==0.22.1
+
+# FastAPI 后端（仅 server.py 使用，跑 main.py 不需要）
+fastapi==0.162.0
+uvicorn==0.54.0

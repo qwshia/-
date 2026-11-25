@@ -15,6 +15,7 @@ load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
 from graph import build_graph, load_checkpointer
 from stream_bus import set_done, reset as reset_stream, _get as _sb_queue
+from utils import _format_attire
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkpoints.db")
 
@@ -54,24 +55,16 @@ def _print_status(result: dict) -> None:
     if items:
         desc_map = result.get("item_desc_map") or {}
         bag_lines = []
-        for i in items:
-            _desc = desc_map.get(i, '用途不明')
-            _content_key = f"__content__:{i}"
-            if _content_key in desc_map:
-                _subs_list = desc_map[_content_key].split(",")
-                _sub_strs = []
-                for _sub in _subs_list:
-                    _sub = _sub.strip()
-                    if not _sub:
-                        continue
-                    _sub_desc = desc_map.get(_sub, "")
-                    if _sub_desc:
-                        _sub_strs.append(f"\n    - {_sub}：{_sub_desc}")
-                    else:
-                        _sub_strs.append(f"\n    - {_sub}")
-                bag_lines.append(f"{i}（{_desc}）\n  [包含子物品]{''.join(_sub_strs)}")
+        for item in items:
+            if isinstance(item, dict):
+                _name = str(item.get("name", "") or "").strip()
+                _count = item.get("count", 1)
+                _desc = desc_map.get(_name) or item.get("desc") or '用途不明'
             else:
-                bag_lines.append(f"{i}（{_desc}）")
+                _name = str(item).strip()
+                _count = 1
+                _desc = desc_map.get(_name, '用途不明')
+            bag_lines.append(f"{_name} (x{_count})（{_desc}）")
         bag = "；\n".join(bag_lines)
         print(f"{C_CYAN}[背包]{C_RESET}\n{bag}")
     else:
@@ -94,20 +87,12 @@ def _print_roster(result: dict) -> None:
     npcs = result.get("npcs") or {}
     for npc_id, info in npcs.items():
         print(f"  - {info.get('name','')}（{npc_id}）：{info.get('role','')} | 性格{info.get('personality','?')} | "
-              f"外貌{info.get('appearance','?')} | 在 {info.get('location','?')} | 穿{info.get('attire','常服')}")
+              f"外貌{info.get('appearance','?')} | 在 {info.get('location','?')} | 穿 {_format_attire(info.get('attire', {}))}")
     print("=" * 40)
 
 
-async def _stream_player(names: dict) -> None:
-    """消费 stream_bus 队列，按 NPC 排队流式播放。
-
-    同一时刻只播放一个 NPC 的流：播放中收到其他 NPC 的 chunk 先存 buffer，
-    当前 NPC 播完（end）才切下一个——多个 NPC 并行生成也不会串线。
-    状态机要点：
-    - header 只在"真的有内容要播"时打一次（header_shown），空回复不显示空名字；
-    - 不用 playing 锁：NPC 失败重试/兜底的 start→chunk→end 序列到达时，
-      只要 chunk 有内容就继续播（header 不重复），杜绝"打了名字却没内容"的假死。
-    """
+async def _stream_player(names: dict, silent: bool = False) -> None:
+    """消费 stream_bus 队列，按 NPC 排队流式播放。silent=True 时不打印文本。"""
     import stream_bus
 
     q = _sb_queue()
@@ -115,6 +100,8 @@ async def _stream_player(names: dict) -> None:
     buffers: dict[str, dict] = {}
 
     def _header(nid: str) -> None:
+        if silent:
+            return
         display = names.get(nid, nid)
         color = C_YELLOW if str(nid).endswith("1") else C_CYAN
         print(f"\n{color}[{display}]{C_RESET} ", end="", flush=True)
@@ -130,9 +117,13 @@ async def _stream_player(names: dict) -> None:
                     _header(nid)
                 current = nid
                 while buf["chunks"]:
-                    print(buf["chunks"].pop(0), end="", flush=True)
+                    if not silent:
+                        print(buf["chunks"].pop(0), end="", flush=True)
+                    else:
+                        buf["chunks"].pop(0)
                 if buf["ended"]:
-                    print()
+                    if not silent:
+                        print()
                     current = None
                     _try_play()
                 return
@@ -155,7 +146,8 @@ async def _stream_player(names: dict) -> None:
             _, nid, text = item
             buf = buffers.setdefault(nid, {"chunks": [], "ended": False, "header_shown": False})
             if nid == current:
-                print(text, end="", flush=True)
+                if not silent:
+                    print(text, end="", flush=True)
             else:
                 buf["chunks"].append(text)
                 if current is None:
@@ -177,16 +169,71 @@ async def _stream_round(app, msg, config, names: dict) -> dict:
     reset_stream()
     print(f"{C_GRAY}（思考中……）{C_RESET}", flush=True)
 
-    player = asyncio.create_task(_stream_player(names))
+    player = None
+    is_multi = False
+
     async for item in app.astream({"user_msg": msg}, config, stream_mode="updates"):
         for node_name, update in (item.items() if isinstance(item, dict) else []):
             if not isinstance(update, dict):
                 continue
+                
+            # 在流式事件中捕获准确的 active_targets 并启动播放器
+            if node_name == "record_input" and player is None:
+                targets = update.get("active_targets") or []
+                is_multi = len(targets) > 1
+                # 彻底关闭流式打印，交由下方全量输出，防止半截截断重复
+                player = asyncio.create_task(_stream_player(names, silent=True))
+            elif player is None:
+                # 如果走的是指令路径，同样静音
+                is_multi = False
+                player = asyncio.create_task(_stream_player(names, silent=True))
+            if node_name == "time_node":
+                ui_events = update.get("ui_events") or []
+                for ev in ui_events:
+                    if ev.get("type") == "pending_expired":
+                        print(f"\n{C_GRAY}【放弃】{ev.get('npc_name')} 最终没能做成（{ev.get('kind')}）{C_RESET}", flush=True)
+                    elif ev.get("type") == "npc_move":
+                        print(f"\n{C_GRAY}【系统】{ev.get('npc')} 悄悄去了 {ev.get('target_scene')}。{C_RESET}", flush=True)
+                continue
             if node_name == "npc_worker":
+                # 多并发时不打印单人台词，交由 narrator_node 统一打印
+                if not is_multi:
+                    hist = update.get("history") or []
+                    for e in hist:
+                        sp = e.get("speaker")
+                        content = e.get("content")
+                        if not content:
+                            continue
+                        if sp == "system":
+                            print(f"\n{C_GRAY}{content}{C_RESET}", flush=True)
+                        else:
+                            # 终端改为全量文本直出，彻底规避流式截断吞字
+                            npc_name = names.get(sp, sp)
+                            print(f"\n{C_YELLOW}[{npc_name}]{C_RESET} {content}", flush=True)
+                    
+                    ui_events = update.get("ui_events") or []
+                    for ev in ui_events:
+                        if ev.get("type") == "npc_bubble":
+                            print(f"{C_GRAY}【{ev.get('npc_name','')}】{ev.get('text')}{C_RESET}", flush=True)
+                continue
+            elif node_name == "arbiter_node":
                 hist = update.get("history") or []
                 for e in hist:
                     if e.get("speaker") == "system" and e.get("content"):
                         print(f"\n{C_GRAY}{e['content']}{C_RESET}", flush=True)
+                ui_events = update.get("ui_events") or []
+                for ev in ui_events:
+                    if ev.get("type") == "pending_set":
+                        print(f"\n{C_GRAY}【暗流】{ev.get('npc_name')} 想做点什么，但放弃了（{ev.get('reason')}）{C_RESET}", flush=True)
+                    elif ev.get("type") == "npc_move":
+                        print(f"\n{C_GRAY}【系统】{ev.get('npc')} 悄悄去了 {ev.get('target_scene')}。{C_RESET}", flush=True)
+                continue
+            elif node_name == "narrator_node":
+                hist = update.get("history") or []
+                for e in hist:
+                    if e.get("speaker") not in ("system", "user") and e.get("content"):
+                        _nm = e.get("display_name", e.get("speaker", ""))
+                        print(f"\n{C_GRAY}【{_nm}】{e['content']}{C_RESET}", flush=True)
                 continue
             elif node_name == "action_engine":
                 hist = update.get("history") or []
@@ -198,14 +245,32 @@ async def _stream_round(app, msg, config, names: dict) -> dict:
                 for e in hist:
                     if e.get("speaker") != "user" and e.get("content"):
                         print(f"\n{C_GRAY}{e['content']}{C_RESET}", flush=True)
+                events = update.get("world_events") or []
+                transfer_events = [e for e in events if "到了玩家手中" in str(e)]
+                if transfer_events:
+                    names = [str(e).replace("到了玩家手中", "").strip() for e in transfer_events]
+                    print(f"\n{C_GRAY}【系统】{'、'.join(names)} 到了玩家手中。{C_RESET}", flush=True)
                 continue
             elif node_name == "record_input":
                 hist = update.get("history") or []
                 for e in hist:
                     if e.get("speaker") == "system" and e.get("content"):
                         print(f"\n{C_GRAY}{e['content']}{C_RESET}", flush=True)
-            elif node_name == "p2p_node" and update.get("p2p_transcript"):
-                print(f"\n{C_GRAY}【旁听】{C_RESET}{update['p2p_transcript']}", flush=True)
+            elif node_name == "p2p_node":
+                # 把 p2p_node 前置拦截的报错打印出来
+                hist = update.get("history") or []
+                for e in hist:
+                    if e.get("speaker") == "system" and e.get("content"):
+                        print(f"\n{C_GRAY}{e['content']}{C_RESET}", flush=True)
+                if update.get("p2p_transcript"):
+                    print(f"\n{C_GRAY}【旁听】{C_RESET}{update['p2p_transcript']}", flush=True)
+                ui_events = update.get("ui_events") or []
+                for ev in ui_events:
+                    if ev.get("type") == "pending_expired":
+                        print(f"\n{C_GRAY}【放弃】{ev.get('npc_name')} 最终没能做成（{ev.get('kind')}）{C_RESET}", flush=True)
+                    elif ev.get("type") == "npc_move":
+                        print(f"\n{C_GRAY}【系统】{ev.get('npc')} 悄悄去了 {ev.get('target_scene')}。{C_RESET}", flush=True)
+                continue
             elif node_name == "hint_node":
                 hist = update.get("history") or []
                 for e in hist:
@@ -254,7 +319,7 @@ async def main() -> None:
                 "\n请给导演一句话的剧本要求（可指定NPC人数，如“两个嫌疑人”）。\n"
                 "提示：可指定NPC名字与风格（如“女主叫周砚，民国风”）；不指定则由导演自行生成。\n> "
             ).strip()
-            result = await app.ainvoke({"task": task}, config)
+            result = await app.ainvoke({"task": task, "style_profile": {}}, config)
 
             print("\n" + "=" * 40)
             print("【剧本背景】")
@@ -269,7 +334,13 @@ async def main() -> None:
                 desc_map = result.get("item_desc_map") or {}
                 print("\n【你随身携带】")
                 for it in init_items:
-                    print(f"  - {it}：{desc_map.get(it, '用途不明')}")
+                    if isinstance(it, dict):
+                        _name = str(it.get("name", "") or "").strip()
+                        _desc = it.get("desc") or desc_map.get(_name, '用途不明')
+                    else:
+                        _name = str(it).strip()
+                        _desc = desc_map.get(_name, '用途不明')
+                    print(f"  - {_name}：{_desc}")
             print("=" * 40 + "\n")
 
             _print_roster(result)
@@ -283,7 +354,7 @@ async def main() -> None:
 
             try:
                 msg = input(
-                    "\n[行动]（@数字/@全部 对话 | @1和@2交流 | !@N 穿上/脱掉/给我/去 物品或地点（NPC指令，需NPC同意） | !去 地点 | !调查 | !提示 | !偷 物品 | 结局是：XXX | quit退出）：\n> "
+                    "\n[行动]（@数字/@全部 对话 | @1和@2交流 | !@N 穿上/脱掉/给我/去 物品或地点（NPC指令，需NPC同意） | !去 地点 | !调查 | !提示 | !偷 NPC名 物品名（如 !偷 卫兵 怀表） | 结局是：XXX | quit退出）：\n> "
                 ).strip()
             except EOFError:
                 break

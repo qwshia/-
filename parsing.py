@@ -8,13 +8,9 @@ _ATTIRE_PUT_ON = [
     re.compile(r"(?:穿上|穿起来|穿戴|套上|披上|戴上)\s*([\u4e00-\u9fa5A-Za-z0-9（）()]{1,12})"),
 ]
 _ATTIRE_TAKE_OFF = [
-    re.compile(r"(?:把|将)?\s*([\u4e00-\u9fa5A-Za-z0-9（）()]{1,12})\s*(?:脱掉|脱下|拿下|卸下|除下)"),
-    re.compile(r"(?:脱掉|脱下|拿下|卸下|除下)\s*([\u4e00-\u9fa5A-Za-z0-9（）()]{1,12})"),
+    re.compile(r"(?:把|将)?\s*([\u4e00-\u9fa5A-Za-z0-9（）()]{1,12})\s*(?:脱掉|脱下|拿下|卸下|除下|脱了)"),
+    re.compile(r"(?:脱掉|脱下|拿下|卸下|除下|脱了)\s*([\u4e00-\u9fa5A-Za-z0-9（）()]{1,12})"),
     re.compile(r"(?:脱光光|脱光|全脱|全部脱掉|脱个精光)"),
-]
-
-_PLAYER_ATTIRE_PAT = [
-    re.compile(r"(?:我|玩家).{0,4}(?:把|将)?\s*([\u4e00-\u9fa5A-Za-z0-9（）()]{1,12})\s*(?:脱掉|脱下|穿上|穿起)"),
 ]
 
 _ITEM_REQ_PAT = [
@@ -22,14 +18,20 @@ _ITEM_REQ_PAT = [
 ]
 
 _MOVE_PAT = [
-    re.compile(r"(?:让|叫|请)?\s*@(?:子|npc_)?\d*\s*(?:去|前往|走到|来到|移动到)\s*([\u4e00-\u9fa5A-Za-z0-9（）()]{1,12})"),
-    re.compile(r"(?:去|前往|走到|来到|移动到)\s*([\u4e00-\u9fa5A-Za-z0-9（）()]{1,12})"),
+    re.compile(r"(?:让|叫|请)?\s*@(?:子|npc_)?\d*\s*(?:去|前往|走到|移动到)\s*([\u4e00-\u9fa5A-Za-z0-9（）()]{1,12})"),
+    re.compile(r"(?:去|前往|走到|移动到)\s*([\u4e00-\u9fa5A-Za-z0-9（）()]{1,12})"),
 ]
 
 
+_CONJUNCTIONS = ("和", "与", "跟", "及", "、")
+
 def _parse_attire_change(msg: str):
+    if any(c in (msg or "") for c in _CONJUNCTIONS):
+        return None
     # 脱光
     if re.search(r"脱光光|脱光|全脱|全部脱掉|脱个精光", msg):
+        return "take_off", "全部"
+    if "全" in (msg or "") and re.search(r"脱", msg or ""):
         return "take_off", "全部"
     for pat in _ATTIRE_PUT_ON:
         m = pat.search(msg)
@@ -49,18 +51,9 @@ def _parse_attire_change(msg: str):
     return None
 
 
-def _parse_player_attire(msg: str):
-    for pat in _PLAYER_ATTIRE_PAT:
-        m = pat.search(msg)
-        if m:
-            item = m.group(1).strip(_ATTIRE_STRIP)
-            if item:
-                act = "take_off" if re.search(r"脱", msg) else "put_on"
-                return act, item
-    return None
-
-
 def _parse_item_request(msg: str, props: list, holder_name: str) -> str | None:
+    if any(c in (msg or "") for c in ("和", "与", "跟")):
+        return None
     # 优先：props 中该 NPC 持有的物品名直接出现在 msg 中
     for p in props:
         if p.get("holder") == holder_name and p.get("name") and p.get("name") in msg:
@@ -80,6 +73,46 @@ def _parse_item_request(msg: str, props: list, holder_name: str) -> str | None:
     return None
 
 
+def _parse_player_give(msg: str, player_items: list) -> str | None:
+    """玩家把背包物品交给当前 NPC。协议：!@N 给 X（前端拖拽拼出）。
+    也兼容自然语言「把 X 给你」「给你 X」「X 给你」。
+    「给我」「给我 X」不算（那是 NPC→玩家的 give_item）。返回匹配到的背包物品名，未匹配返回 None。"""
+    if not msg:
+        return None
+    items = [str(x) for x in (player_items or []) if x]
+    if not items:
+        return None
+    text = msg.strip()
+    has_gei_wo = bool(re.search(r"(?:给|交给|递给|送)\s*我", text))
+    has_gei_npc = bool(re.search(r"(?:给|交给|递给|送)\s*(?:你|您|ta|TA|她|他)", text))
+    if has_gei_wo and not has_gei_npc:
+        return None
+
+    cands = []
+    m = re.match(r"^(?:给|交给|递给|送)\s*([\u4e00-\u9fa5A-Za-z0-9（）()]{1,12})\s*$", text)
+    if m:
+        cands.append(m.group(1).strip(_ATTIRE_STRIP))
+    m = re.search(r"(?:把|将)\s*([\u4e00-\u9fa5A-Za-z0-9（）()]{1,12})\s*(?:给|交给|递给|送)\s*(?:你|您|ta|TA|她|他)", text)
+    if m:
+        cands.append(m.group(1).strip(_ATTIRE_STRIP))
+    m = re.search(r"(?:给|交给|递给|送)\s*(?:你|您|ta|TA|她|他)\s*([\u4e00-\u9fa5A-Za-z0-9（）()]{1,12})", text)
+    if m:
+        cands.append(m.group(1).strip(_ATTIRE_STRIP))
+    m = re.search(r"([\u4e00-\u9fa5A-Za-z0-9（）()]{1,12})\s*(?:给|交给|递给|送)\s*(?:你|您|ta|TA|她|他)", text)
+    if m:
+        cands.append(m.group(1).strip(_ATTIRE_STRIP))
+
+    for cand in cands:
+        if not cand:
+            continue
+        if cand in items:
+            return cand
+        for it in items:
+            if cand in it or it in cand:
+                return it
+    return None
+
+
 def _parse_npc_move(msg: str, avail: list) -> str | None:
     for pat in _MOVE_PAT:
         m = pat.search(msg)
@@ -91,17 +124,66 @@ def _parse_npc_move(msg: str, avail: list) -> str | None:
     return None
 
 
-def _apply_attire(cur: str, action: str, item: str) -> str:
-    item = item.strip(_ATTIRE_STRIP)
+_ATTIRE_PREFIXES = ("外罩", "内穿", "身着", "穿着", "足蹬", "头戴", "手持", "披着", "套着", "外披", "内衬")
+
+
+def _strip_attire_affixes(s: str) -> str:
+    s = s or ""
+    for w in _ATTIRE_PREFIXES:
+        s = s.replace(w, "")
+    return s.strip(_ATTIRE_STRIP)
+
+
+def _apply_attire(cur, action: str, item) -> dict:
+    if not isinstance(cur, dict):
+        if isinstance(cur, str):
+            cur = {"全装": cur.strip()} if cur.strip() and cur.strip() not in ("", "无") else {}
+        else:
+            cur = {}
+    cur = dict(cur)
+    if isinstance(item, (list, tuple)):
+        items = [str(x) for x in item]
+    else:
+        items = [item]
+
     if action == "take_off":
-        if item in ("衣服", "衣", "全部", "所有", "全身", "全部衣服"):
-            return ""
-        parts = [s for s in re.split(r"[，,、;；]", cur) if item not in s]
-        res = "，".join(parts).strip("，,、;； ")
-        return res
-    if item in cur:
+        for it in items:
+            it_s = (it or "").strip() if isinstance(it, str) else str(it).strip()
+            it_core = _strip_attire_affixes(it_s) or it_s
+            if any(k in it_s for k in ("全部", "所有", "衣服")) or it_core in ("衣服", "衣", "全部", "所有", "全身", "全部衣服"):
+                return {}
+        for key in list(cur.keys()):
+            val = str(cur.get(key, "") or "")
+            val_core = _strip_attire_affixes(val) or val
+            for it in items:
+                it_s = (it or "").strip() if isinstance(it, str) else str(it).strip()
+                it_core = _strip_attire_affixes(it_s) or it_s
+                matched = False
+                if it_s and (it_s in val or val in it_s or it_s in key or key in it_s
+                             or it_core in val_core or val_core in it_core):
+                    matched = True
+                # 长句包含：value（或其核心词）出现在长句中
+                if not matched:
+                    # 滑动窗口：val_core 中任意长度>=2 的子串出现在 it_s 中
+                    for L in range(min(len(val_core), 4), 1, -1):
+                        for i in range(len(val_core) - L + 1):
+                            sub = val_core[i:i+L]
+                            if sub and sub in it_s:
+                                matched = True
+                                break
+                        if matched:
+                            break
+                if matched:
+                    del cur[key]
+                    break
         return cur
-    return (cur + "，" + item) if cur else item
+
+    # put_on
+    for it in items:
+        it_s = (it or "").strip() if isinstance(it, str) else str(it).strip()
+        if it_s and it_s not in [str(v) for v in cur.values()]:
+            cur["外衣"] = it_s
+    return cur
 
 
 _NPC_CMD_PREFIX = re.compile(r"^\s*[!！]\s*@(?:子|npc_)?\d+\s*")
@@ -116,3 +198,65 @@ def _strip_npc_cmd_prefix(msg: str) -> str:
     """剥掉 !令 @N 前缀，返回剩余内容（给 _parse_* 识别与 prompt 用）。"""
     return _NPC_CMD_PREFIX.sub("", msg or "", count=1).strip()
 
+
+_STEAL_VERB_RE = re.compile(r"^(?:偷|窃取|顺走|拿走)\s*")
+
+
+def _parse_steal_cmd(msg: str) -> dict | None:
+    """解析偷窃指令。返回 {"npc_name": str, "item_name": str} 或 None。
+    支持格式：
+      - !偷 NPC名          → {"npc_name": "NPC名", "item_name": ""}（随机偷该 NPC 一件）
+      - !偷 物品名         → {"npc_name": "", "item_name": "物品名"}（由 item_node 兜底按物品名匹配）
+      - !偷 NPC名 物品名   → 两者都指定
+    单参数统一先当 npc_name（前端「偷」按钮发的是 NPC 名）；item_node 会按在场 NPC 名兜底判断。"""
+    if not msg:
+        return None
+    text = msg.lstrip().lstrip("!！").strip()
+    m = _STEAL_VERB_RE.match(text)
+    if not m:
+        return None
+    rest = text[m.end():].strip()
+    if not rest:
+        return None
+    parts = rest.split()
+    if len(parts) == 1:
+        return {"npc_name": parts[0].strip(_ATTIRE_STRIP), "item_name": ""}
+    npc_name = parts[0].strip(_ATTIRE_STRIP)
+    item_name = parts[-1].strip(_ATTIRE_STRIP)
+    if not item_name:
+        return None
+    return {"npc_name": npc_name, "item_name": item_name}
+
+
+_PROBE_WORDS = ("套话", "套你话", "逼问", "追问", "审问", "盘问", "质问", "试探", "施压", "逼供", "威胁")
+
+
+_USE_RE = re.compile(r"^[!！]\s*使用\s*([\u4e00-\u9fa5A-Za-z0-9（）()]{1,12})")
+
+
+def _parse_use_cmd(msg: str) -> dict | None:
+    """解析道具使用指令：!使用 道具 [对 目标]。
+    返回 {"item": "道具名", "target": "目标名"} 或 None。"""
+    if not msg:
+        return None
+    text = msg.lstrip().lstrip("!！").strip()
+    if not text.startswith("使用"):
+        return None
+    body = text[2:].strip()
+    if not body:
+        return None
+    item_name = ""
+    target = ""
+    if "对" in body:
+        left, _, right = body.partition("对")
+        item_name = left.strip(_ATTIRE_STRIP)
+        target = right.strip(_ATTIRE_STRIP)
+    elif "给" in body:
+        left, _, right = body.partition("给")
+        item_name = left.strip(_ATTIRE_STRIP)
+        target = right.strip(_ATTIRE_STRIP)
+    else:
+        item_name = body.strip(_ATTIRE_STRIP)
+    if not item_name:
+        return None
+    return {"item": item_name, "target": target}

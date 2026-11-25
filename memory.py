@@ -5,7 +5,7 @@ from config import memory_llm
 
 
 async def _compress(texts: list) -> str:
-    prompt = "把以下对话压缩成一段简短摘要（100字内），保留关键信息：\n" + "\n".join(texts)
+    prompt = "把以下对话压缩成一段简短摘要(≤100字), 保留关键信息:\n" + "\n".join(texts)
     try:
         r = await memory_llm.ainvoke([HumanMessage(content=prompt)])
         return (r.content or "").strip() or "\n".join(texts)[:200]
@@ -19,7 +19,7 @@ async def _compress_two(a: str, b: str) -> str:
         return ""
     if len(parts) == 1:
         return parts[0]
-    prompt = "把以下两段摘要合并成一段简短摘要（200字内）：\n" + "\n---\n".join(parts)
+    prompt = "把以下两段摘要合并成一段简短摘要(≤200字):\n" + "\n---\n".join(parts)
     try:
         r = await memory_llm.ainvoke([HumanMessage(content=prompt)])
         return (r.content or "").strip() or " | ".join(parts)[:300]

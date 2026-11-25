@@ -1,4 +1,4 @@
-"""剧情判定节点（story_keeper）：统一线索提取。"""
+"""剧情判定节点（story_keeper）：统一线索提取（包含世界动态视角）。"""
 import difflib
 import re
 
@@ -48,20 +48,63 @@ def _clues_txt(clues: list) -> str:
     return "\n".join(f"- {c}" for c in clues) or "（无）"
 
 
-def _story_prompt(window: str, existing_clues: list, global_truth: str, ending_goal: str, recent_events: list) -> str:
+def _build_world_dynamics(state: AgentState) -> str:
+    """提取 1.5-6 要求的全局动态（world_events / life_events / pending_intent）。"""
+    npcs = state.get("npcs") or {}
+    world_events = state.get("world_events") or []
+    
+    # 1. world_events 最近 6 条
+    events_txt = "；".join(world_events[-6:]) or "（无）"
+    
+    # 2. life_events 合并取最新 6 条
+    all_life_events = []
+    for nid, info in npcs.items():
+        name = info.get("name", nid)
+        for ev in (info.get("life_events") or []):
+            if isinstance(ev, dict) and ev.get("event"):
+                all_life_events.append({
+                    "tick": ev.get("tick", 0),
+                    "npc": name,
+                    "event": ev.get("event")
+                })
+    all_life_events.sort(key=lambda x: x["tick"], reverse=True)
+    recent_life = all_life_events[:6]
+    life_txt = "；".join([f"{le['npc']}：{le['event']}" for le in recent_life]) or "（无）"
+    
+    # 3. pending_intent 状态
+    pending_lines = []
+    for nid, info in npcs.items():
+        name = info.get("name", nid)
+        for pi in (info.get("pending_intent") or []):
+            pending_lines.append(f"{name}想做：{pi.get('kind')} {pi.get('target')}")
+    pending_txt = "；".join(pending_lines) or "（无）"
+    
     return (
-        "你是剧情判定官。请从[近期对话]中提取新线索和世界事件。\n"
-        "[核心铁律]：线索和事件必须与[主线目标]或[真相]直接相关！日常动作、寒暄、进门、身体接触（如牵手、拥抱）属于无意义交互，绝对不能算作线索。宁可输出空值，也绝不记录与结局无关的废话！\n"
-        "player_revealed_clues:新线索,一句话,只写真正新增的已知信息(真相/身份/地点/物品用途/机制/约定),15字以内;\n"
-        "world_event:客观已发生的行动事实——谁见了谁,谁去了哪,谁达成约定,只写和结局有关的事实.一句话,15字以内;\n"
-        "查重:必须与[最近已知线索]比对,同义/包含/高度相似一律丢弃.\n"
-        "参考结局真相(后台)以判断哪些信息与结局相关:\n"
+        f"[世界动态事件]\n{events_txt}\n"
+        f"[NPC近期经历]\n{life_txt}\n"
+        f"[NPC未完成意图]\n{pending_txt}\n"
+    )
+
+
+def _story_prompt(window: str, existing_clues: list, global_truth: str, ending_goal: str, world_dynamics: str) -> str:
+    return (
+        "你是剧情判定官. 从[近期对话]和[世界动态]提取新线索和世界事件.\n"
+        "[核心铁律]\n"
+        "1. 线索和事件必须与[主线目标]或[真相]直接相关.\n"
+        "2. 日常动作/寒暄/进门/身体接触属于无意义交互, 不算线索.\n"
+        "3. 无实质进展就输出空数组和空字符串, 宁可空也不记废话.\n"
+        "4. 查重: 与[最近已知线索]比对, 同义/包含/高度相似一律丢弃.\n"
+        "[字段定义]\n"
+        "player_revealed_clues: 新线索数组, 每项一句话, 只写真正新增的已知信息(真相/身份/地点/物品用途/机制/约定), ≤15字\n"
+        "world_event: 已发生的客观行动事实(谁见谁/谁去哪/谁达成约定), 只写与结局有关的, ≤15字\n"
+        "[判定参考真相-后台]\n"
         f"{global_truth}\n"
-        f"主线目标:{ending_goal}\n\n"
-        f"[最近已知线索]\n{_clues_txt(existing_clues[-6:])}\n\n"
-        f"[最近已发生事件]\n{(';'.join(recent_events[-3:])) or '（无）'}\n\n"
+        f"[主线目标] {ending_goal}\n"
+        f"[最近已知线索]\n{_clues_txt(existing_clues[-6:])}\n"
+        f"{world_dynamics}"
         f"[近期对话]\n{window}\n\n"
-        '只输出JSON:{"player_revealed_clues": [], "world_event": ""}'
+        "[输出格式-只输出JSON, 不要任何额外文字]\n"
+        '{"player_revealed_clues": [], "world_event": ""}'
     )
 
 
@@ -90,7 +133,9 @@ async def story_keeper(state: AgentState) -> dict:
         return out
 
     existing = list(state.get("player_revealed_clues") or [])
-    prompt = _story_prompt(window, existing, state.get("global_truth", ""), state.get("ending_goal", ""), state.get("world_events") or [])
+    world_dynamics = _build_world_dynamics(state)
+    prompt = _story_prompt(window, existing, state.get("global_truth", ""), state.get("ending_goal", ""), world_dynamics)
+    
     try:
         resp = await judge_llm.ainvoke([HumanMessage(content=prompt)])
         parsed = _parse_json(resp.content)
