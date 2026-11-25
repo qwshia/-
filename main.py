@@ -213,12 +213,8 @@ async def _stream_round(app, msg, config, names: dict) -> dict:
                     
                     ui_events = update.get("ui_events") or []
                     for ev in ui_events:
-                        if ev.get("type") == "ripple":
-                            print(f"{C_GRAY}【余波】{ev.get('text')}{C_RESET}", flush=True)
-                        elif ev.get("type") == "show_options":
-                            opts = ev.get("options", [])
-                            if opts:
-                                print(f"\n{C_GREEN}【可快捷回复】{C_RESET} " + " | ".join(opts), flush=True)
+                        if ev.get("type") == "npc_bubble":
+                            print(f"{C_GRAY}【{ev.get('npc_name','')}】{ev.get('text')}{C_RESET}", flush=True)
                 continue
             elif node_name == "arbiter_node":
                 hist = update.get("history") or []
@@ -235,8 +231,9 @@ async def _stream_round(app, msg, config, names: dict) -> dict:
             elif node_name == "narrator_node":
                 hist = update.get("history") or []
                 for e in hist:
-                    if e.get("speaker") == "system" and e.get("content"):
-                        print(f"\n{C_GRAY}{e['content']}{C_RESET}", flush=True)
+                    if e.get("speaker") not in ("system", "user") and e.get("content"):
+                        _nm = e.get("display_name", e.get("speaker", ""))
+                        print(f"\n{C_GRAY}【{_nm}】{e['content']}{C_RESET}", flush=True)
                 continue
             elif node_name == "action_engine":
                 hist = update.get("history") or []
@@ -322,7 +319,7 @@ async def main() -> None:
                 "\n请给导演一句话的剧本要求（可指定NPC人数，如“两个嫌疑人”）。\n"
                 "提示：可指定NPC名字与风格（如“女主叫周砚，民国风”）；不指定则由导演自行生成。\n> "
             ).strip()
-            result = await app.ainvoke({"task": task}, config)
+            result = await app.ainvoke({"task": task, "style_profile": {}}, config)
 
             print("\n" + "=" * 40)
             print("【剧本背景】")
@@ -357,7 +354,7 @@ async def main() -> None:
 
             try:
                 msg = input(
-                    "\n[行动]（@数字/@全部 对话 | @1和@2交流 | !@N 穿上/脱掉/给我/去 物品或地点（NPC指令，需NPC同意） | !去 地点 | !调查 | !提示 | !偷 物品 | 结局是：XXX | quit退出）：\n> "
+                    "\n[行动]（@数字/@全部 对话 | @1和@2交流 | !@N 穿上/脱掉/给我/去 物品或地点（NPC指令，需NPC同意） | !去 地点 | !调查 | !提示 | !偷 NPC名 物品名（如 !偷 卫兵 怀表） | 结局是：XXX | quit退出）：\n> "
                 ).strip()
             except EOFError:
                 break

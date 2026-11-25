@@ -4,16 +4,16 @@ from langchain_core.messages import HumanMessage
 from config import memory_llm
 from state import AgentState
 from utils import _parse_json
+from constants import VALID_MOODS, VALID_STABILITY, VALID_TIME_PHASES
 
 
 async def update_npc_life(state: AgentState, current_tick: int) -> dict:
-    # 每 5 个 world_tick 更新一次
-    if current_tick % 5 != 0:
-        return {}
+    # 触发条件已由 graph.py 在外层控制（跨越时间档），此处直接执行
 
     npcs = state.get("npcs") or {}
     time_phase = state.get("time_phase", "")
     patches = {}
+    life_ui_events = []
 
     # ==========================================
     # 1. 准备批量提炼的 Prompt
@@ -24,7 +24,7 @@ async def update_npc_life(state: AgentState, current_tick: int) -> dict:
         npc_context_lines = []
         for nid, info in npcs.items():
             name = info.get("name", nid)
-            goal = info.get("core_goal") or {}
+            goal = info.get("core_drive") or info.get("core_goal") or {}
             goal_txt = goal.get("goal", "无明确执念") if isinstance(goal, dict) else "无明确执念"
             recent_l1 = (info.get("memory") or {}).get("l1") or []
             dialogue_txt = " | ".join(recent_l1[-3:]) if recent_l1 else "（最近无对话）"
@@ -32,24 +32,21 @@ async def update_npc_life(state: AgentState, current_tick: int) -> dict:
 
         npc_context = "\n\n".join(npc_context_lines)
 
-        prompt = f"""你是游戏系统的记忆提炼器。请根据最近的世界事件和各NPC的近期对话，判断每个NPC是否经历了值得写进长期记忆的“主观事件”。
+        prompt = f"""你是游戏系统的记忆提炼器.
 [最近世界事件]
 {recent_world_events}
-
 [NPC近期状态]
 {npc_context}
 
-[提炼规则]
-1. 只有让该NPC产生情绪波动、利益受损、认知改变或安全感丧失的事，才算“值得记住的事件”。
-2. 日常寒暄、无意义对话、与NPC无关的世界事件，绝对不要生成。如果没有值得记住的事，对应NPC的数组必须为空。
-3. 事件（event）必须写该NPC的主观视角（如“我发现仓库门没锁”），不要写上帝视角（如“玩家去了仓库”）。
-4. emotion只能选一个：平静、焦虑、烦躁、愉悦、恐惧、压抑。
+[任务] 判断每个NPC是否经历了值得写入长期记忆的[主观事件].
+[规则]
+1. 只有让该NPC产生情绪波动/利益受损/认知改变/安全感丧失的事, 才算[值得记住]. 日常寒暄/无意义对话/与NPC无关的事件, 绝不生成.
+2. 无值得记住的事, 该NPC数组必须为空.
+3. event必须写NPC主观视角(如'我发现仓库门没锁'), 禁止上帝视角(如'玩家去了仓库').
+4. emotion只能从[平静/焦虑/烦躁/愉悦/恐惧/压抑]选一个.
 
-[输出格式]严格输出JSON，不要其他文字：
-{{
-  "npc_1": [{{"event": "...", "emotion": "..."}}],
-  "npc_2": []
-}}"""
+[输出格式-只输出JSON]
+{{"npc_1": [{{"event": "...", "emotion": "..."}}], "npc_2": []}}"""
 
         try:
             resp = await memory_llm.ainvoke([HumanMessage(content=prompt)])
@@ -85,10 +82,12 @@ async def update_npc_life(state: AgentState, current_tick: int) -> dict:
 
             # 如果有新经历，按最新经历的情绪覆盖当前 mood
             last_ev_emo = old_events[-1].get("emotion", "平静")
+            _stability = mood_dict.get("stability", "stable") if (mood_dict := (info.get("mood") or {})) else "stable"
             p["mood"] = {
                 "current": last_ev_emo,
                 "reason": f"经历：{old_events[-1].get('event', '')}",
-                "since_tick": current_tick
+                "since_tick": current_tick,
+                "stability": _stability,
             }
 
         # b. 更新 current_action
@@ -111,27 +110,51 @@ async def update_npc_life(state: AgentState, current_tick: int) -> dict:
         old_act = (info.get("current_action") or {}).get("action", "")
         if old_act != act:
             p["current_action"] = {"action": act, "since_tick": current_tick}
+            # 日常动作变化 → 发气泡事件（前端 NPC 头顶气泡展示生活切片）
+            life_ui_events.append({
+                "type": "npc_bubble",
+                "npc_id": nid,
+                "npc_name": str(info.get("name", nid)),
+                "text": f"正在{act}…",
+            })
 
         # c. 基础情绪偏移（如果本轮没生成新事件，用时间兜底）
         if "mood" not in p:
             mood_dict = info.get("mood") or {}
             current_mood = mood_dict.get("current", "平静")
+            stability = mood_dict.get("stability", "stable")
             base_mood = current_mood
             # 只在当前是平静时，深夜才转压抑。不再强行把非平静转平静。
             if time_phase in ("深夜", "凌晨") and current_mood == "平静":
                 base_mood = "压抑"
+            # fragile 的 NPC 在压力下更容易 mood swing
+            if stability == "fragile" and current_mood in ("平静", "愉悦"):
+                if random.random() < 0.3:
+                    base_mood = "焦虑"
             if base_mood != current_mood:
-                p["mood"] = {"current": base_mood, "reason": f"时间到了{time_phase}", "since_tick": current_tick}
+                p["mood"] = {"current": base_mood, "reason": f"时间到了{time_phase}", "since_tick": current_tick, "stability": stability}
 
-        # d. 社交欲望生成（仅当完全空闲时才极低概率发起）
-        # 条件：当前无意图、pending 队列为空（不含任何动作）、且 10% 的极低概率
-        if not info.get("current_intent") and not info.get("pending_intent") and random.random() < 0.10:
-            same_scene_npcs = [n2 for n2, i2 in npcs.items() if i2.get("location") == info.get("location") and n2 != nid]
-            if same_scene_npcs:
-                target_nid = random.choice(same_scene_npcs)
-                target_name = npcs[target_nid].get("name")
+        # d. 社交欲望生成：空闲 NPC 主动找人交流（提高频率 + 支持跨场景 + 双向续聊）
+        # 条件：当前无明确意图、且 social_initiative 概率发起
+        _si = float(info.get("social_initiative", 0.4) or 0.4)
+        if not info.get("current_intent") and random.random() < _si:
+            # 优先找近期对话过的 NPC 续聊（自然产生 B→A 的回应方开口），其次同场景，最后跨场景随机
+            recent_names = []
+            for _m in (info.get("memory") or {}).get("l1") or []:
+                for _n2, _i2 in npcs.items():
+                    if _n2 != nid and _i2.get("name") and _i2["name"] in str(_m):
+                        recent_names.append(_i2["name"])
+                        break
+            candidates = []
+            if recent_names:
+                candidates = [nm for nm in recent_names if any(i2.get("name") == nm for i2 in npcs.values())]
+            if not candidates:
+                candidates = [i2.get("name") for n2, i2 in npcs.items()
+                              if i2.get("location") == info.get("location") and n2 != nid and i2.get("name")]
+            if candidates:
+                target_name = random.choice(candidates)
                 p["pending_intent"] = [{
-                    "kind": "chat",
+                    "kind": "bg_chat",
                     "payload": target_name,
                     "remain": 1,
                     "source": "autonomy"
@@ -140,6 +163,11 @@ async def update_npc_life(state: AgentState, current_tick: int) -> dict:
         if p:
             patches[nid] = p
 
-    if patches:
-        return {"npcs": patches}
+    if patches or life_ui_events:
+        out = {}
+        if patches:
+            out["npcs"] = patches
+        if life_ui_events:
+            out["ui_events"] = life_ui_events
+        return out
     return {}

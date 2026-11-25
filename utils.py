@@ -10,7 +10,7 @@ from typing import List
 from state import AgentState
 
 
-TIME_PHASES = ["清晨", "上午", "正午", "午后", "黄昏", "夜晚", "深夜", "凌晨"]
+from constants import VALID_TIME_PHASES as TIME_PHASES
 
 
 def time_index(phase: str) -> int:
@@ -70,11 +70,12 @@ def time_is_up(start: str, limit: str, progress: float) -> bool:
 
 def time_step(state: AgentState) -> dict:
 
-    """时间推进：不再依赖 time_limit。只要游戏开始，时间就固定流转。"""
+    """时间推进：不再依赖 time_limit。步长由 time_step_delta 动态决定。"""
     start = state.get("time_start", "清晨")
 
     progress = float(state.get("time_progress") or 0.0)
-    new_progress = progress + 0.2
+    delta = float(state.get("time_step_delta") or 0.2)
+    new_progress = progress + delta
     return {"time_progress": new_progress, "time_phase": phase_display(start, new_progress)}
 
 
@@ -105,34 +106,69 @@ def time_advance(state: AgentState) -> dict:
 
 
 def _parse_json(text) -> dict:
-    # 如果是 list 格式（新版 LangChain 常见）
-    if isinstance(text, list):
-        parts = []
-        for part in text:
-            if isinstance(part, dict) and part.get("type") == "text":
-                parts.append(part.get("text", ""))
-            elif isinstance(part, str):
-                parts.append(part)
-        text = "".join(parts)
+    def _unwrap_blocks(obj):
+        if isinstance(obj, list):
+            parts = []
+            for part in obj:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    parts.append(part.get("text", ""))
+                elif isinstance(part, str):
+                    parts.append(part)
+            if parts:
+                return "".join(parts)
+        return None
+
+    # 1) 字符串形式的 block 数组：先 json.loads 再解包
+    if isinstance(text, str):
+        s = text.strip()
+        try:
+            maybe = json.loads(s)
+            unwrapped = _unwrap_blocks(maybe)
+            if unwrapped is not None:
+                text = unwrapped
+        except Exception:
+            pass
+    # 2) 真 list 形式的 block 数组
+    elif isinstance(text, list):
+        unwrapped = _unwrap_blocks(text)
+        if unwrapped is not None:
+            text = unwrapped
     elif not isinstance(text, str):
         text = str(text)
-        
+
+    if not isinstance(text, str):
+        text = str(text)
+
+    # 3) 剥离 think 标签与代码围栏
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
     try:
-        text = text.strip()
-        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text).strip()
-        return json.loads(text)
+        t = text.strip()
+        t = re.sub(r"^```(?:json)?\s*|\s*```$", "", t).strip()
+        result = json.loads(t)
+        if isinstance(result, dict):
+            return result
+        # 4) 解析结果仍是 block 列表 → 递归解包
+        if isinstance(result, list):
+            unwrapped = _unwrap_blocks(result)
+            if unwrapped is not None:
+                inner = _parse_json(unwrapped)
+                if isinstance(inner, dict):
+                    return inner
     except Exception:
-        decoder = json.JSONDecoder()
-        idx = text.find("{")
-        while idx != -1:
-            try:
-                obj, _ = decoder.raw_decode(text[idx:])
-                if isinstance(obj, dict):
-                    return obj
-            except Exception:
-                pass
-            idx = text.find("{", idx + 1)
-        return {}
+        pass
+
+    # 5) 兜底：从文本中搜索第一个完整 JSON 对象
+    decoder = json.JSONDecoder()
+    idx = text.find("{")
+    while idx != -1:
+        try:
+            obj, _ = decoder.raw_decode(text[idx:])
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            pass
+        idx = text.find("{", idx + 1)
+    return {}
 
 
 def _npc_display(state: AgentState, npc_id: str) -> str:
@@ -205,30 +241,6 @@ def is_scene_move_cmd(msg: str, state: AgentState) -> bool:
     return False
 
 
-def _parse_content(content: list) -> list[dict]:
-
-    """把容器 content 元素归一为 {"name": 道具名, "text": 文本全文}：
-
-    - 字符串：普通道具（钥匙/物件），text 为空，开箱只登记名字；
-
-    - 对象 {"name","text"}：文本道具（密信/字条/日记），开箱时系统当场展示 text。
-    """
-
-
-    out = []
-
-    for c in content or []:
-
-        if isinstance(c, str):
-
-            out.append({"name": c, "text": ""})
-
-        elif isinstance(c, dict) and c.get("name"):
-
-            out.append({"name": c["name"], "text": c.get("text", "") or ""})
-
-    return out
-
 
 def _format_attire(attire) -> str:
     if isinstance(attire, dict):
@@ -284,131 +296,7 @@ def _upsert_item(items: list, name: str, count: int = 1, desc: str = "") -> list
     return items
 
 
-def handle_container_open(container_name, desc_map, props, player_items, scenes):
-    """开箱全流程：解析 __content__，把子物品加入背包，清空父容器，还原子物品描述。返回子物品名列表。"""
-    container_name = str(container_name or "").strip()
-    if not container_name:
-        return []
-    raw = (desc_map or {}).get(f"__content__:{container_name}", "[]")
-    try:
-        raw_subs = json.loads(str(raw)) if raw else []
-    except Exception:
-        raw_subs = [x.strip() for x in str(raw).split(",") if x.strip()]
-    subs = []
-    sub_texts = {}
-    for x in (raw_subs if isinstance(raw_subs, list) else []):
-        if isinstance(x, dict):
-            nm = str(x.get("name", "") or "").strip()
-            if nm:
-                subs.append(nm)
-                t = str(x.get("text", "") or x.get("desc", "") or "").strip()
-                if t:
-                    sub_texts[nm] = t
-        else:
-            nm = str(x).strip()
-            if nm:
-                subs.append(nm)
-    for s in subs:
-        if s not in _get_item_names(player_items):
-            _upsert_item(player_items, s, count=1)
-        real = sub_texts.get(s, "") or _resolve_sub_desc(s, container_name, props, scenes, desc_map)
-        # Brute-force: also try any container content if still empty
-        if not real or real == "一件普通的物品。":
-            for p in (props or []):
-                if isinstance(p, dict) and isinstance(p.get("content"), list):
-                    for c in p["content"]:
-                        if isinstance(c, dict) and str(c.get("name", "")).strip() == s:
-                            if c.get("text"):
-                                real = str(c["text"]).strip()
-                            elif c.get("desc"):
-                                real = str(c["desc"]).strip()
-                            break
-                    if real and real != "一件普通的物品。":
-                        break
-        if not real or real == "一件普通的物品。":
-            for sdef in (scenes or {}).values():
-                if not isinstance(sdef, dict):
-                    continue
-                for it in (sdef.get("items") or []):
-                    if isinstance(it, dict) and isinstance(it.get("content"), list):
-                        for c in it["content"]:
-                            if isinstance(c, dict) and str(c.get("name", "")).strip() == s:
-                                if c.get("text"):
-                                    real = str(c["text"]).strip()
-                                elif c.get("desc"):
-                                    real = str(c["desc"]).strip()
-                                break
-                        if real and real != "一件普通的物品。":
-                            break
-                    if real and real != "一件普通的物品。":
-                        break
-                if real and real != "一件普通的物品。":
-                    break
-        # Assign or remove placeholder completely
-        if not real or real == "一件普通的物品。":
-            real = "一件普通的物品。"
-        if real:
-            desc_map[s] = real
-        else:
-            desc_map[s] = "一件普通的物品。"
-        for it in (player_items or []):
-            if isinstance(it, dict) and str(it.get("name", "")).strip() == s:
-                if real:
-                    it["desc"] = real
-                else:
-                    it["desc"] = "一件普通的物品。"
-        for pp in (props or []):
-            if isinstance(pp, dict) and pp.get("name") == s:
-                pp.pop("container", None)
-    d = str((desc_map or {}).get(container_name, "") or "")
-    base = d.split("（锁着")[0].strip() if "（锁着" in d else d.strip()
-    if isinstance(desc_map, dict):
-        desc_map[container_name] = f"{base}（已开启）"
-        desc_map.pop(f"__content__:{container_name}", None)
-        desc_map.pop(f"__agreed__:{container_name}", None)
-    return subs
 
-
-def _resolve_sub_desc(sub_name, loc, props, scenes, desc_map):
-    sub_name = str(sub_name).strip()
-    # 1. Look into raw __content__ JSON first
-    raw = (desc_map or {}).get(f"__content__:{loc}", "")
-    if raw:
-        try:
-            parsed = json.loads(raw)
-            for c in parsed:
-                if isinstance(c, dict) and str(c.get("name")).strip() == sub_name:
-                    if c.get("text"):
-                        return str(c["text"]).strip()
-                    if c.get("desc"):
-                        return str(c["desc"]).strip()
-        except Exception:
-            pass
-
-    # 2. Brute-force search in props
-    for p in (props or []):
-        if isinstance(p.get("content"), list):
-            for c in p["content"]:
-                if isinstance(c, dict) and str(c.get("name")).strip() == sub_name:
-                    if c.get("text"):
-                        return str(c["text"]).strip()
-                    if c.get("desc"):
-                        return str(c["desc"]).strip()
-
-    # 3. Brute-force search in scenes
-    for sdef in (scenes or {}).values():
-        if not isinstance(sdef, dict):
-            continue
-        for it in (sdef.get("items") or []):
-            if isinstance(it, dict) and isinstance(it.get("content"), list):
-                for c in it["content"]:
-                    if isinstance(c, dict) and str(c.get("name")).strip() == sub_name:
-                        if c.get("text"):
-                            return str(c["text"]).strip()
-                        if c.get("desc"):
-                            return str(c["desc"]).strip()
-
-    return "一件普通的物品。"
 
 
 def tick_pending(state: dict) -> dict:

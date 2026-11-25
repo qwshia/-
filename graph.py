@@ -11,6 +11,7 @@
   story_node.py  剧情判定官（LLM 辅助 + 五维确定性解锁终审）
   hint_node.py   导演提示（按需，不进历史）
   ending_node.py 结局判定（多结局保留，前置拦截）
+  timeline_genesis.py 时间线生成（仅有限时剧本，与 NPC 血肉并行）
   graph.py       构图（本文件）
 
 图结构：
@@ -18,7 +19,8 @@
   record_input → fan_out（Send 并发在场 NPC | story_keeper | sync_status）——story_keeper 与 NPC 回话并行
   npc_worker → item_node → time_node → sync_status；action_engine → item_node → time_node → sync_status
   p2p_node → story_keeper → sync_status（p2p 节点内部推进时间）
-  world_genesis / story_keeper / hint_node → sync_status → END
+  world_genesis → npc_genesis (+ 有时限时并行 timeline_genesis) → sync_status
+  story_keeper / hint_node → sync_status → END
   judge_ending / end_node → END
 """
 from langgraph.graph import StateGraph, START, END
@@ -28,7 +30,10 @@ import re
 from state import AgentState, load_checkpointer
 from world import world_genesis
 from npc_genesis import npc_genesis
-from input_node import record_input, fan_out
+from social_genesis import social_genesis
+from social_node import social_node
+from timeline_genesis import timeline_genesis
+from input_node import record_input, fan_out, fan_out_action
 from npc_node import npc_worker
 from arbiter_node import arbiter_node
 from narrator_node import narrator_node
@@ -57,6 +62,8 @@ def route_next(state: AgentState):
         _m = msg.lstrip().lstrip("!！").strip().lower()
         if _m in ("提示", "hint", "帮助", "help") or _m.startswith("提示"):
             return "hint_node"
+        if _m.startswith("使用"):
+            return "action_engine"
         if _m.startswith(("调查", "打开")):
             return "action_engine"
     if is_p2p(msg):
@@ -99,30 +106,19 @@ async def time_node(state: AgentState) -> dict:
         if merged_hist:
             out["history"] = merged_hist
 
-    # 3. 生活层更新
-    from npc_life_tick import update_npc_life
-    _life = await update_npc_life(state, new_tick)
-    if _life:
-        _life_npcs = _life.pop("npcs", None)
-        out.update(_life)
-        if _life_npcs:
-            out.setdefault("npcs", {}).update(_life_npcs)
+    # 3. 生活层更新（仅当跨越了完整的时间档位时触发）
+    old_p = float(state.get("time_progress") or 0.0)
+    new_p = float(out.get("time_progress") or old_p)
+    if int(old_p) != int(new_p):
+        from npc_life_tick import update_npc_life
+        _life = await update_npc_life(state, new_tick)
+        if _life:
+            _life_npcs = _life.pop("npcs", None)
+            out.update(_life)
+            if _life_npcs:
+                out.setdefault("npcs", {}).update(_life_npcs)
 
-    # 4. 巡检：检查是否有 NPC 自主发起的 chat 意图
-    bg_chat = []
-    for nid, info in (state.get("npcs") or {}).items():
-        for pi in (info.get("pending_intent") or []):
-            if pi.get("kind") == "chat" and pi.get("remain", 0) <= 1:
-                target_name = pi.get("payload", "")
-                # 查找同场景的 target
-                for nid2, info2 in (state.get("npcs") or {}).items():
-                    if info2.get("name") == target_name and info2.get("location") == info.get("location") and nid != nid2:
-                        bg_chat.append([nid, nid2])
-                        break
-    if bg_chat:
-        out["bg_chat_targets"] = bg_chat[0] if bg_chat else []
-
-    # 5. 消费未完成意图缓存
+    # 4. 消费未完成意图缓存
     from utils import tick_pending
     _pending = tick_pending({**state, "world_tick": new_tick})
     if _pending:
@@ -142,14 +138,92 @@ async def time_node(state: AgentState) -> dict:
     return out
 
 
+def bg_chat_node(state: AgentState) -> dict:
+    """后台 NPC 自主对话巡检（串行执行，避免在 Send 并发分支内重复触发同一场对话）。
+
+    - 同场景：返回 bg_chat_targets=[a,b]，交给 p2p_node 生成对话。
+    - 跨场景找人：先移动过去（remain 重置为 2，下一 tick 同场景触发对话）；
+      若目标正是玩家当前场景，补一条"XX 来了"的系统提示，避免 NPC 突然出现。
+    """
+    out = {}
+    bg_chat = []
+    npcs = state.get("npcs") or {}
+    for nid, info in npcs.items():
+        for pi in (info.get("pending_intent") or []):
+            if pi.get("kind") != "bg_chat" or pi.get("remain", 0) > 1:
+                continue
+            target_name = pi.get("payload", "")
+            target_nid, target_info = None, None
+            for nid2, info2 in npcs.items():
+                if info2.get("name") == target_name and nid != nid2:
+                    target_nid, target_info = nid2, info2
+                    break
+            if target_nid is None:
+                continue
+            if target_info.get("location") == info.get("location"):
+                # 同场景：直接对话
+                bg_chat.append([nid, target_nid])
+            else:
+                # 跨场景找人：移动过去，重置该意图 remain 供下一 tick 同场景触发对话
+                _new_pending = []
+                for pi2 in (info.get("pending_intent") or []):
+                    if pi2.get("kind") == "bg_chat" and pi2.get("payload") == target_name:
+                        _new_pending.append({**pi2, "remain": 2})
+                    else:
+                        _new_pending.append(pi2)
+                _moved_to = target_info.get("location")
+                _npc_patch = out.setdefault("npcs", {}).setdefault(nid, {})
+                _npc_patch["location"] = _moved_to
+                _npc_patch["pending_intent"] = _new_pending
+                out.setdefault("world_events", []).append(
+                    f"{info.get('name', nid)}离开{info.get('location')}，前往{_moved_to}找{target_name}")
+                out.setdefault("ui_events", []).append(
+                    {"type": "npc_move", "npc": info.get("name", nid), "target_scene": _moved_to})
+    out["bg_chat_targets"] = bg_chat[0] if bg_chat else []
+    return out
+
+
 def sync_status(state: AgentState) -> dict:
     return {}
+
+
+def _route_after_bg_chat(state: AgentState):
+    """后台对话巡检后的路由：有 bg_chat 则进 p2p，否则按 run_story 决定是否提取线索。"""
+    if state.get("bg_chat_targets"):
+        return "p2p_node"
+    if state.get("run_story"):
+        return "story_keeper"
+    return "end"
+
+
+def _route_after_world(state: AgentState):
+    if state.get("time_limit"):
+        return ["npc_genesis", "timeline_genesis"]
+    return "npc_genesis_no_timeline"
+
+
+def _route_after_item(state: AgentState):
+    """item_node 后的路由：有物理动作则并发广播旁观，否则推进时间。"""
+    if state.get("last_player_action"):
+        return fan_out_action(state)
+    return "time_node"
+
+
+def _route_after_p2p(state: AgentState):
+    """p2p_node 后的路由：前台 p2p 有物理动作则并发广播旁观，后台 bg_chat 直达 story_keeper。"""
+    if state.get("last_player_action"):
+        return fan_out_action(state)
+    return "story_keeper"
 
 
 def build_graph(checkpointer=None):
     g = StateGraph(AgentState)
     g.add_node("world_genesis", world_genesis)
     g.add_node("npc_genesis", npc_genesis)
+    g.add_node("social_genesis", social_genesis)
+    g.add_node("npc_genesis_no_timeline", npc_genesis)
+    g.add_node("social_node", social_node)
+    g.add_node("timeline_genesis", timeline_genesis)
     g.add_node("record_input", record_input)
     g.add_node("intent_engine", intent_engine)
     g.add_node("npc_worker", npc_worker)
@@ -163,6 +237,7 @@ def build_graph(checkpointer=None):
     g.add_node("hint_node", hint_node)
     g.add_node("judge_ending", judge_ending)
     g.add_node("sync_status", sync_status)
+    g.add_node("bg_chat_node", bg_chat_node)
 
     g.add_conditional_edges(
         START, route_next,
@@ -177,8 +252,20 @@ def build_graph(checkpointer=None):
         },
     )
 
-    g.add_edge("world_genesis", "npc_genesis")
-    g.add_edge("npc_genesis", "sync_status")
+    g.add_conditional_edges(
+        "world_genesis",
+        _route_after_world,
+        {
+            "npc_genesis": "npc_genesis",
+            "npc_genesis_no_timeline": "npc_genesis_no_timeline",
+            "timeline_genesis": "timeline_genesis",
+        },
+    )
+    g.add_edge("npc_genesis", "social_genesis")
+    g.add_edge("npc_genesis_no_timeline", "social_genesis")
+    g.add_edge("social_genesis", "sync_status")
+    g.add_edge("timeline_genesis", "sync_status")
+    # Keep the no-time path out of the parallel barrier, which waits for timeline_genesis.
 
     g.add_conditional_edges(
         "record_input",
@@ -193,18 +280,17 @@ def build_graph(checkpointer=None):
     g.add_edge("narrator_node", "arbiter_node")
     g.add_edge("arbiter_node", "item_node")
     g.add_edge("action_engine", "item_node")
-    g.add_edge("item_node", "time_node")
+    
+    g.add_conditional_edges("item_node", _route_after_item)
+    g.add_edge("time_node", "sync_status")
+    g.add_edge("sync_status", "social_node")
+    g.add_edge("social_node", "bg_chat_node")
     g.add_conditional_edges(
-        "time_node", 
-        lambda s: "p2p_node" if s.get("bg_chat_targets") else "sync_status",
-        {"p2p_node": "p2p_node", "sync_status": "sync_status"},
-    )
-    g.add_conditional_edges(
-        "sync_status", lambda s: "story_keeper" if s.get("run_story") else "end",
-        {"story_keeper": "story_keeper", "end": END},
+        "bg_chat_node", _route_after_bg_chat,
+        {"p2p_node": "p2p_node", "story_keeper": "story_keeper", "end": END},
     )
     g.add_edge("story_keeper", END)
-    g.add_edge("p2p_node", "story_keeper")
+    g.add_conditional_edges("p2p_node", _route_after_p2p)
     g.add_edge("judge_ending", END)
     g.add_edge("hint_node", END)
 

@@ -1,17 +1,15 @@
-"""结局判定节点：judge_ending —— 玩家推理 vs 导演设计真相对比判定。
+"""结局判定节点：judge_ending —— 玩家推理 vs 导演设计的结局列表对比判定。
 
-第一步：系统先判时间——导演设了时限且轮数已走满（time_progress 越过 time_limit），
-        直接按"超时未达成目标"判 LOSE（不调 LLM，省 token）。
-第二步（未超时/不限时）：把玩家推理与 global_truth / ending_goal 宽松对比，
-        核心大致对上即 WIN（提及伪善/隐藏动机等加分）。
-判定结果以 'WIN: '/'LOSE: ' 开头写进 history。
-结局判定【不结束游戏】：揭晓后玩家仍可继续对话/调查，也可再次输入"结局是"改判。
+第一步：系统先判时间——导演设了时限且轮数已走满，直接按超时 LOSE（不调 LLM）。
+第二步（未超时/不限时）：把玩家推理与 global_truth / endings 对比，由判定官从结局列表
+    中选最匹配的一个结局（单结局或多结局均可），输出"结局名 + 复盘"。
+判定结果以 '结局：' 开头写进 history。结局判定不结束游戏：揭晓后仍可继续，也可再次输入改判。
 """
 from langchain_core.messages import HumanMessage
 
 from config import judge_llm
 from state import AgentState
-from utils import time_is_up, time_step
+from utils import time_is_up
 
 
 async def judge_ending(state: AgentState) -> dict:
@@ -30,7 +28,7 @@ async def judge_ending(state: AgentState) -> dict:
         truth = (state.get("global_truth", "") or "")[:200]
         return {
             "history": [{"speaker": "system", "content": (
-                f"LOSE: 时间已到 {limit}，关键节点已经来临（{goal}），你来不及完成布局，功败垂成。"
+                f"结局：功败垂成 - 时间已到 {limit}，关键节点已经来临（{goal}），你来不及完成布局。"
                 f"复盘：{truth}")}],
         }
 
@@ -38,29 +36,41 @@ async def judge_ending(state: AgentState) -> dict:
     truth_leads = state.get("truth_leads") or []
     leads_txt = "\n".join(f"- {l.get('fact')}" for l in truth_leads
                           if isinstance(l, dict) and l.get("fact")) or "（导演未拆分，以真相全文为准）"
+    endings = state.get("endings") or []
+    endings_txt = ""
+    if endings:
+        endings_txt = "\n".join(
+            f"{e.get('id', '')}: {e.get('name', '')} —— 达成条件：{e.get('condition', '')}；结局画面：{e.get('desc', '')}"
+            for e in endings if isinstance(e, dict) and e.get("name")
+        )
+    if not endings_txt:
+        endings_txt = "（未配置结局列表，按真相达成与否判定）"
+
     prompt = (
-        "你是最终判定官.玩家给出推理,与导演真相对比.\n\n"
+        "你是最终判定官. 对比玩家推理与导演结局列表.\n"
         f"[真相]\n{state.get('global_truth', '')}\n"
         f"[关键事实点]\n{leads_txt}\n"
         f"[主线目标]\n{state.get('ending_goal', '')}\n"
         f"[时间状态]\n"
         + (f"当前:{state.get('time_phase', '清晨')};关键点:{state.get('time_limit')}\n" if state.get('time_limit') else "(不限时)\n")
-        + f"\n[玩家线索]\n{(';'.join(clues)) or '(无)'}\n\n"
+        + f"[玩家线索]\n{(';'.join(clues)) or '(无)'}\n"
+        f"[结局列表]\n{endings_txt}\n"
         f"[玩家推理]\n{player_answer}\n\n"
-        "判定:\n"
-        "1. 获胜前提:玩家推理与真相[核心语义]对上(幕后黑手/关键机制/道具用途/事件链);名词记错不算错,方向对即对上;只有核心方向完全错误才失败.\n"
-        "2. 对照[关键事实点]逐条判断覆盖与正确性,覆盖核心事实点即 WIN.\n"
-        "3. 加分:核心已对上时,额外提到伪善/隐藏动机/隐藏信息且方向对,仍 WIN;核心错误时加分不能单独 WIN.\n"
-        "4. 超时:有关键时间点且轮数已超,即使核心正确也失败,复盘注明'超时失败'.\n"
-        "5. 输出:WIN: [线路名] 或 LOSE: [线路名] 开头;正确先点明对在哪里再80-120字复盘;错误指明偏差再80-120字复盘.\n"
-        "直接输出结果文本,不要 JSON."
+        "[判定规则]\n"
+        "1. 从[结局列表]中选一个最符合玩家推理结果的结局：对照[真相]与[关键事实点]，核心方向对上选达成类结局，"
+        "部分对上选部分达成类结局，完全错误选失败类结局.\n"
+        "2. 若结局列表只有1个结局，则按其达成条件判断：满足则输出该结局，不满足则输出'功败垂成'作为失败结局.\n"
+        "3. 名词记错不算错, 方向对即对上; 只有核心方向完全错误才判失败.\n"
+        "[输出格式-严格]\n"
+        "  结局：<结局名> - <80-120字复盘>\n"
+        "直接输出文本, 不要JSON."
     )
-    
+
     try:
         response = await judge_llm.ainvoke([HumanMessage(content=prompt)])
         content = response.content
     except Exception:
-        content = "LOSE: 判定时发生网络错误。"
+        content = "结局：判定失败 - 判定时发生网络错误。"
     return {
         "history": [{"speaker": "system", "content": content}],
     }

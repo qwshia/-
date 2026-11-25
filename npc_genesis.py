@@ -1,25 +1,34 @@
 """NPC 血肉生成节点：npc_genesis
 
 读 world_genesis 输出的 NPC 名单（骨架），为每个 NPC 生成血肉：
-- 骨架必有：personality_traits / goal / daily_routine / mood
-- 血肉可选：core_goal / short_term_goal / secrets / forbidden / hallucinations / weakness
+- 必填：background / appearance / attire / personality / life_goal / cognition / mood / core_drive / affection / self_interest / moral_boundary / attachment
+- 可选：fears / desires / perspective / contradictions / impulsivity / social_initiative / weakness
 
-一次 LLM 调用生成全部 NPC。独立生成，不互相参照。骨架字段缺则报错，不静默兜底。
+一次 LLM 调用生成全部 NPC。独立生成，不互相参照。必填字段缺则报错，不静默兜底。
+可选字段缺省时按空值处理。
+
+cognition 为认知字典，条目 type in {fact, secret, belief, forbidden}，运行时可动态增删。
+fact: 全部 NPC 都可能知道的公开事实（npc_genesis 可生成，也可置空由运行时补充）。
+secret: NPC 的个人秘密（npc_genesis 生成）。
+belief: 基于有限信息的推断（npc_genesis 可生成，运行时可追加/修改）。
+forbidden: NPC 拒绝谈论的话题（npc_genesis 生成）。
 """
 import json
 import sys
-from typing import Dict
+from typing import Dict, List
 
 from langchain_core.messages import HumanMessage
 
 from config import world_llm
 from state import AgentState
-from utils import _parse_json
+from constants import VALID_MOODS, VALID_STABILITY, VALID_COGNITION_TYPES, VALID_SERVES
+from npc_genesis_prompt_builder import build_npc_prompt
 
 
-_VALID_MOODS = {"平静", "焦虑", "烦躁", "愉悦", "恐惧", "压抑"}
-_VALID_WEAKNESS_TYPES = {"fear", "guilt", "greed", "pride", "attachment"}
-_VALID_PHASES = ["清晨", "上午", "正午", "午后", "黄昏", "夜晚", "深夜", "凌晨"]
+_VALID_MOODS = VALID_MOODS
+_VALID_STABILITY = VALID_STABILITY
+_VALID_COGNITION_TYPES = VALID_COGNITION_TYPES
+_VALID_SERVES = VALID_SERVES
 
 
 async def npc_genesis(state: AgentState) -> dict:
@@ -27,84 +36,48 @@ async def npc_genesis(state: AgentState) -> dict:
     if not npcs_raw:
         raise RuntimeError("[npc_genesis] 收到空 NPC 名单，world_genesis 未生成 NPC")
 
+    style_profile = state.get("style_profile") if isinstance(state.get("style_profile"), dict) else {}
+
+    backstory = state.get("backstory", "")
+    ending_goal = state.get("ending_goal", "")
+    global_truth = state.get("global_truth", "")
+
+    # 场景名列表（供 props 引用校验）
+    scenes_raw = state.get("scenes") or {}
+    scene_names = list(scenes_raw.keys()) if isinstance(scenes_raw, dict) else []
+    if not scene_names:
+        scene_names = state.get("available_scenes") or []
+
+    # 物品名列表（供 secrets/weakness 引用校验）
+    item_names = []
+    for sdef in (scenes_raw.values() if isinstance(scenes_raw, dict) else []):
+        if isinstance(sdef, dict):
+            for it in (sdef.get("items") or []):
+                if isinstance(it, dict) and it.get("name"):
+                    item_names.append(str(it["name"]).strip())
+    for p in (state.get("props") or []):
+        if isinstance(p, dict) and p.get("name"):
+            item_names.append(str(p["name"]).strip())
+    item_names = list(dict.fromkeys(item_names))
+
     roster = []
     for nid, info in npcs_raw.items():
         roster.append({
             "id": nid,
             "name": info.get("name", ""),
             "role": info.get("role", ""),
-            "personality": info.get("personality", ""),
-            "appearance": info.get("appearance", ""),
-            "attire": info.get("attire", {}),
             "location": info.get("location", ""),
         })
 
-    backstory = state.get("backstory", "")
-    ending_goal = state.get("ending_goal", "")
-    global_truth = state.get("global_truth", "")
-
-    prompt = f"""你是角色铸造师。给定一个剧本的 NPC 名单，为每个 NPC 生成血肉。只输出严格 JSON，不要任何额外文字、说明或 markdown 标记。
-
-[剧本背景]
-backstory: {backstory}
-ending_goal: {ending_goal}
-global_truth: {global_truth}
-
-[NPC 名单]
-{json.dumps(roster, ensure_ascii=False, indent=2)}
-
-[任务]
-为每个 NPC 生成以下字段：
-
-[骨架字段 - 必填]
-1. personality_traits: 数组，2~4 条特质，结构 [{{"trait": "多疑", "intensity": 80}}]
-   - trait 必须具体，禁止使用"普通""温和""善良"这类空话
-   - intensity 为 0-100 的整数
-2. goal: 字符串，一句话写"这个人想过什么日子"（模糊的人生目标，不是任务）
-3. daily_routine: 数组，3~5 条日常行为，结构 [{{"phase": "清晨", "actions": ["擦杯子", "看窗外"]}}]
-   - phase 只能取：清晨 / 上午 / 正午 / 午后 / 黄昏 / 夜晚 / 深夜 / 凌晨
-   - actions 每个时段 1~3 个具体日常动作，必须具体（写"擦杯子"不写"工作"）
-4. mood: 对象，结构 {{"current": "平静", "reason": "开局", "since_tick": 0}}
-   - current 只能取：平静 / 焦虑 / 烦躁 / 愉悦 / 恐惧 / 压抑
-
-[血肉字段 - 可选，按剧本类型决定]
-5. short_term_goal: 对象 {{"goal": "...", "source": "core_goal|daily|player"}} 或 null
-6. core_goal: 对象 {{"goal": "...", "priority": 100}} 或 null
-7. secrets: 数组 [{{"fact": "...", "reveal_condition": "..."}}] 或 []
-8. forbidden: 数组 [{{"fact": "...", "conceal_condition": "..."}}] 或 []
-9. hallucinations: 数组 [{{"belief": "...", "source": "..."}}] 或 []
-10. weakness: 对象 {{"trigger": "...", "trigger_keywords": ["..."], "type": "fear", "state": "closed", "reaction": "..."}} 或 {{}}
-
-[生成约束]
-1. 每个 NPC 独立生成，禁止互相参照。
-2. 剧本类型决定血肉量：悬疑/推理/密室类，至少 1 个 NPC 有 secrets；日常/治愈/田园类，可以全部 NPC 都没有 core_goal。
-3. 不强制每个 NPC 都有 core_goal/secrets/forbidden/weakness。村民可以全无，凶手才有全套。
-4. 若 global_truth 描述有人做了坏事，至少 1 个 NPC 知道（secrets 里包含这件事）。这个"知情者"不一定是敌人，也可以是帮玩家的人。
-5. 两个 NPC 的 core_goal 或 personality_traits 高度相似时，重写其中一个，避免同质化。
-6. weakness.trigger_keywords 2~4 个短语，禁止用"你""什么""知道"这类无区分度通用词。
-7. weakness.type 只能取：fear / guilt / greed / pride / attachment。
-8. weakness.reaction 必须是具体行为，其中提到的物品/信息必须已在剧本中出现。
-9. short_term_goal.source 只能取：core_goal（服务长期目标）/ daily（日常小事）/ player（针对玩家）。
-
-[输出格式]
-严格 JSON，无其他文字：
-{{
-  "npcs": [
-    {{
-      "id": "npc_1",
-      "personality_traits": [{{"trait": "多疑", "intensity": 80}}],
-      "goal": "...",
-      "daily_routine": [{{"phase": "清晨", "actions": ["..."]}}],
-      "mood": {{"current": "平静", "reason": "开局", "since_tick": 0}},
-      "short_term_goal": null,
-      "core_goal": null,
-      "secrets": [],
-      "forbidden": [],
-      "hallucinations": [],
-      "weakness": {{}}
-    }}
-  ]
-}}"""
+    prompt = build_npc_prompt(
+        backstory=backstory,
+        ending_goal=ending_goal,
+        global_truth=global_truth,
+        roster=roster,
+        style_profile=style_profile,
+        scenes=scene_names,
+        props=item_names,
+    )
 
     try:
         response = await world_llm.ainvoke([HumanMessage(content=prompt)])
@@ -123,7 +96,7 @@ global_truth: {global_truth}
             npcs_parsed = [parsed]
     elif isinstance(parsed, list):
         npcs_parsed = parsed
-    
+
     if not isinstance(npcs_parsed, list) or not npcs_parsed:
         print(f"[npc_genesis 解析失败] 原始输出: {str(parsed)[:500]}", file=sys.stderr)
         raise RuntimeError("[npc_genesis] 血肉生成返回为空或格式错误")
@@ -135,137 +108,234 @@ global_truth: {global_truth}
 
     npc_patches: Dict[str, dict] = {}
     missing = []
+
     for nid, info in npcs_raw.items():
         flesh = flesh_by_id.get(nid)
         if flesh is None:
             missing.append(f"{nid}(无返回)")
             continue
 
-        _traits = flesh.get("personality_traits")
-        if not isinstance(_traits, list) or not _traits:
-            missing.append(f"{nid}.personality_traits")
-            continue
-        _clean_traits = []
-        for t in _traits:
-            if isinstance(t, dict) and t.get("trait"):
-                try:
-                    _intensity = int(t.get("intensity", 50))
-                except (TypeError, ValueError):
-                    _intensity = 50
-                _clean_traits.append({
-                    "trait": str(t["trait"]).strip(),
-                    "intensity": max(0, min(100, _intensity)),
-                })
-        if not _clean_traits:
-            missing.append(f"{nid}.personality_traits(空)")
+        # ---- 必填：background ----
+        _background = str(flesh.get("background", "") or "").strip()
+        if not _background:
+            missing.append(f"{nid}.background")
             continue
 
-        _goal = str(flesh.get("goal", "") or "").strip()
-        if not _goal:
-            missing.append(f"{nid}.goal")
+        # ---- 必填：appearance ----
+        _appearance = str(flesh.get("appearance", "") or "").strip()
+        if not _appearance:
+            missing.append(f"{nid}.appearance")
             continue
 
-        _routine = flesh.get("daily_routine")
-        if not isinstance(_routine, list) or not _routine:
-            missing.append(f"{nid}.daily_routine")
-            continue
-        _clean_routine = []
-        for r in _routine:
-            if isinstance(r, dict) and r.get("phase") in _VALID_PHASES:
-                _actions = r.get("actions")
-                if isinstance(_actions, list):
-                    _clean_actions = [str(a).strip() for a in _actions if str(a).strip()]
-                    if _clean_actions:
-                        _clean_routine.append({"phase": r["phase"], "actions": _clean_actions})
-        if not _clean_routine:
-            missing.append(f"{nid}.daily_routine(空)")
+        # ---- 必填：attire ----
+        _attire_raw = flesh.get("attire")
+        _attire = {}
+        if isinstance(_attire_raw, dict):
+            for _ak, _av in _attire_raw.items():
+                _av = str(_av or "").strip()
+                if _av and _av not in ("无", "无无"):
+                    _attire[str(_ak).strip()] = _av
+        elif isinstance(_attire_raw, str) and _attire_raw.strip() and _attire_raw.strip() != "无":
+            _attire = {"全装": _attire_raw.strip()}
+
+        if not _attire:
+            missing.append(f"{nid}.attire(空)")
             continue
 
+        # ---- 必填：personality ----
+        _personality = str(flesh.get("personality", "") or "").strip()
+        if not _personality:
+            missing.append(f"{nid}.personality")
+            continue
+
+        # ---- 必填：life_goal ----
+        _life_goal = str(flesh.get("life_goal", "") or "").strip()
+        if not _life_goal:
+            missing.append(f"{nid}.life_goal")
+            continue
+
+        # ---- 必填：cognition ----
+        _cognition_raw = flesh.get("cognition")
+        _cognition = []
+        if isinstance(_cognition_raw, list):
+            for entry in _cognition_raw:
+                if not isinstance(entry, dict):
+                    continue
+                content = str(entry.get("content", "") or "").strip()
+                ctype = str(entry.get("type", "") or "").strip().lower()
+                if not content or ctype not in _VALID_COGNITION_TYPES:
+                    continue
+                cleaned = {"content": content, "type": ctype}
+                if ctype == "secret":
+                    rc = str(entry.get("reveal_condition", "") or "").strip()
+                    if rc:
+                        cleaned["reveal_condition"] = rc
+                    kb = entry.get("known_by")
+                    if isinstance(kb, list):
+                        cleaned["known_by"] = [str(k).strip() for k in kb if str(k).strip()]
+                    else:
+                        cleaned["known_by"] = []
+                elif ctype == "belief":
+                    try:
+                        conf = int(entry.get("confidence", 50))
+                    except (TypeError, ValueError):
+                        conf = 50
+                    cleaned["confidence"] = max(0, min(100, conf))
+                elif ctype == "forbidden":
+                    reason = str(entry.get("reason", "") or "").strip()
+                    if reason:
+                        cleaned["reason"] = reason
+                _cognition.append(cleaned)
+
+        # ---- 必填：mood ----
         _mood_raw = flesh.get("mood") if isinstance(flesh.get("mood"), dict) else {}
         _mood_current = str(_mood_raw.get("current", "") or "").strip()
         if _mood_current not in _VALID_MOODS:
             _mood_current = "平静"
+        _mood_stability = str(_mood_raw.get("stability", "stable") or "stable").strip().lower()
+        if _mood_stability not in _VALID_STABILITY:
+            _mood_stability = "stable"
         _mood = {
             "current": _mood_current,
             "reason": str(_mood_raw.get("reason", "开局") or "开局").strip(),
             "since_tick": 0,
+            "stability": _mood_stability,
         }
 
-        _stg = flesh.get("short_term_goal")
-        if isinstance(_stg, dict) and _stg.get("goal"):
-            _short_term_goal = {
-                "goal": str(_stg["goal"]).strip(),
-                "source": str(_stg.get("source", "daily") or "daily").strip(),
-            }
-        else:
-            _short_term_goal = None
+        # ---- 必填：core_drive ----
+        _cg = flesh.get("core_drive")
+        if not isinstance(_cg, dict):
+            _cg = flesh.get("core_goal")  # 兼容旧字段名
+        if not (isinstance(_cg, dict) and _cg.get("goal")):
+            missing.append(f"{nid}.core_drive")
+            continue
+        try:
+            _priority = int(_cg.get("priority", 100))
+        except (TypeError, ValueError):
+            _priority = 100
+        _serves = str(_cg.get("serves", "self") or "self").strip().lower()
+        if _serves not in _VALID_SERVES:
+            _serves = "self"
+        _core_drive = {
+            "goal": str(_cg["goal"]).strip(),
+            "priority": _priority,
+            "serves": _serves,
+        }
 
-        _cg = flesh.get("core_goal")
-        if isinstance(_cg, dict) and _cg.get("goal"):
-            try:
-                _priority = int(_cg.get("priority", 100))
-            except (TypeError, ValueError):
-                _priority = 100
-            _core_goal = {"goal": str(_cg["goal"]).strip(), "priority": _priority}
-        else:
-            _core_goal = None
+        # ---- 必填：affection ----
+        try:
+            _affection = int(flesh.get("affection", 100))
+        except (TypeError, ValueError):
+            missing.append(f"{nid}.affection")
+            continue
 
-        def _clean_list(raw, keys):
-            if not isinstance(raw, list):
-                return []
-            out = []
-            for x in raw:
-                if not isinstance(x, dict):
-                    continue
-                cleaned = {}
-                for k in keys:
-                    v = str(x.get(k, "") or "").strip()
-                    if v:
-                        cleaned[k] = v
-                if cleaned:
-                    out.append(cleaned)
-            return out
+        # ---- 必填：self_interest ----
+        try:
+            _self_interest = float(flesh.get("self_interest", 0.5))
+        except (TypeError, ValueError):
+            missing.append(f"{nid}.self_interest")
+            continue
+        _self_interest = max(0.0, min(1.0, _self_interest))
 
-        _secrets = _clean_list(flesh.get("secrets"), ["fact", "reveal_condition"])
-        _forbidden = _clean_list(flesh.get("forbidden"), ["fact", "conceal_condition"])
-        _hallucinations = _clean_list(flesh.get("hallucinations"), ["belief", "source"])
+        # ---- 必填：moral_boundary ----
+        try:
+            _moral_boundary = float(flesh.get("moral_boundary", 0.5))
+        except (TypeError, ValueError):
+            missing.append(f"{nid}.moral_boundary")
+            continue
+        _moral_boundary = max(0.0, min(1.0, _moral_boundary))
 
+        # ---- 必填：attachment ----
+        try:
+            _attachment = float(flesh.get("attachment", 0.5))
+        except (TypeError, ValueError):
+            missing.append(f"{nid}.attachment")
+            continue
+        _attachment = max(0.0, min(1.0, _attachment))
+
+        # ---- 可选：fears ----
+        _fears = []
+        if isinstance(flesh.get("fears"), list):
+            _fears = [str(f).strip() for f in flesh["fears"] if str(f).strip()]
+
+        # ---- 可选：desires ----
+        _desires = []
+        if isinstance(flesh.get("desires"), list):
+            _desires = [str(d).strip() for d in flesh["desires"] if str(d).strip()]
+
+        # ---- 可选：perspective ----
+        _perspective = str(flesh.get("perspective", "") or "").strip()
+
+        # ---- 可选：contradictions ----
+        _contradictions = []
+        if isinstance(flesh.get("contradictions"), list):
+            _contradictions = [str(c).strip() for c in flesh["contradictions"] if str(c).strip()]
+
+        # ---- 可选：impulsivity ----
+        try:
+            _impulsivity = float(flesh.get("impulsivity", 0.5))
+        except (TypeError, ValueError):
+            _impulsivity = 0.5
+        _impulsivity = max(0.0, min(1.0, _impulsivity))
+
+        # ---- 可选：weakness ----
         _w_raw = flesh.get("weakness") if isinstance(flesh.get("weakness"), dict) else {}
+        _weakness = {}
         if _w_raw.get("trigger") and _w_raw.get("reaction"):
             _kws = _w_raw.get("trigger_keywords")
             _clean_kws = []
             if isinstance(_kws, list):
                 _clean_kws = [str(k).strip() for k in _kws if str(k).strip()][:4]
-            _wtype = str(_w_raw.get("type", "") or "").strip()
-            if _wtype not in _VALID_WEAKNESS_TYPES:
-                _wtype = "fear"
             if _clean_kws:
                 _weakness = {
                     "trigger": str(_w_raw["trigger"]).strip(),
                     "trigger_keywords": _clean_kws,
-                    "type": _wtype,
                     "state": "closed",
                     "reaction": str(_w_raw["reaction"]).strip(),
                 }
-            else:
-                _weakness = {}
-        else:
-            _weakness = {}
 
-        npc_patches[nid] = {
-            "personality_traits": _clean_traits,
-            "goal": _goal,
-            "daily_routine": _clean_routine,
+        # ---- 可选：social_initiative ----
+        try:
+            _social_initiative = float(flesh.get("social_initiative", 0.4))
+        except (TypeError, ValueError):
+            _social_initiative = 0.4
+        _social_initiative = max(0.0, min(1.0, _social_initiative))
+
+        # ---- 组装 patch ----
+        npc_patch = {
+            "background": _background,
+            "appearance": _appearance,
+            "attire": _attire,
+            "personality": _personality,
+            "life_goal": _life_goal,
+            "cognition": _cognition,
             "mood": _mood,
-            "short_term_goal": _short_term_goal,
-            "core_goal": _core_goal,
-            "secrets": _secrets,
-            "forbidden": _forbidden,
-            "hallucinations": _hallucinations,
-            "weakness": _weakness,
+            "core_drive": _core_drive,
+            "affection": _affection,
+            "self_interest": _self_interest,
+            "moral_boundary": _moral_boundary,
+            "attachment": _attachment,
         }
 
+        # 可选字段：有值才写入
+        if _fears:
+            npc_patch["fears"] = _fears
+        if _desires:
+            npc_patch["desires"] = _desires
+        if _perspective:
+            npc_patch["perspective"] = _perspective
+        if _contradictions:
+            npc_patch["contradictions"] = _contradictions
+        npc_patch["impulsivity"] = _impulsivity
+        npc_patch["social_initiative"] = _social_initiative
+        if _weakness:
+            npc_patch["weakness"] = _weakness
+        else:
+            npc_patch["weakness"] = {}
+
+        npc_patches[nid] = npc_patch
+
     if missing:
-        raise RuntimeError(f"[npc_genesis] 以下 NPC 骨架字段缺失：{missing}")
+        raise RuntimeError(f"[npc_genesis] 以下 NPC 必填字段缺失：{missing}")
 
     return {"npcs": npc_patches}

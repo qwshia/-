@@ -6,14 +6,14 @@
 只通过 p2p_transcript 交给 story_keeper 提取其中有用的线索；并广播一条世界事件让其他 NPC 感知。
 """
 import re
+import random
 
 from langchain_core.messages import HumanMessage
 
 from config import actor_llm
 from state import AgentState
 from langchain_core.runnables import RunnableConfig
-from utils import time_advance, _format_attire
-from time_events import apply_time_events
+from utils import _format_attire
 
 _P2P_RE = re.compile(
     r"(?:让|叫|请|麻烦|安排)?\s*"
@@ -54,8 +54,9 @@ async def _npc_talk(prompt: str) -> tuple[str, bool]:
 
 def _role_block(info: dict, npc_id: str) -> str:
     name = info.get("name", npc_id)
-    secrets = "\n".join(f"- {s}" for s in info.get("secrets", []))
-    forbidden = "\n".join(f"- {f}" for f in info.get("forbidden", []))
+    _cog = info.get("cognition") or []
+    secrets = "\n".join(f"- {c.get('content', '')}" for c in _cog if isinstance(c, dict) and c.get("type") == "secret" and c.get("content"))
+    forbidden = "\n".join(f"- {c.get('content', '')}" for c in _cog if isinstance(c, dict) and c.get("type") == "forbidden" and c.get("content"))
     cognition_parts = []
     if secrets:
         cognition_parts.append(f"- 你确知的事实：\n{secrets}")
@@ -68,7 +69,7 @@ def _role_block(info: dict, npc_id: str) -> str:
     return (
         f"姓名：{name} | 身份：{info.get('role', '路人')}\n"
         f"性格：{info.get('personality', '普通')} | 外貌：{info.get('appearance', '普通')} | 衣着：{_format_attire(info.get('attire', {}))}\n"
-        f"真实目标：{info.get('goal', '')}\n"
+        f"真实目标：{info.get('life_goal', info.get('goal', ''))}\n"
         f"[认知状态]\n{cognition_text}\n"
         f"[你的个人记忆]\n{mem_text}\n"
     )
@@ -86,6 +87,9 @@ async def p2p_node(state: AgentState, config: RunnableConfig) -> dict:
 
     if is_bg:
         a, b = bg_chat[0], bg_chat[1]
+        # 双向：随机决定谁先开口，避免永远 A→B，让 NPC 交流"活起来"
+        if random.random() < 0.5:
+            a, b = b, a
         info_a = npcs.get(a) or {}
         info_b = npcs.get(b) or {}
         # 后台触发时，用前一次的历史动作/事件当话题，或者让模型自己找话
@@ -97,6 +101,7 @@ async def p2p_node(state: AgentState, config: RunnableConfig) -> dict:
             return {
                 "history": [{"speaker": "system",
                              "content": "【系统】请用「@1和@2交流」这样的格式指定两个当前场景内的NPC交谈。"}],
+                "last_player_action": None,
             }
         info_a = npcs.get(a) or {}
         info_b = npcs.get(b) or {}
@@ -106,6 +111,7 @@ async def p2p_node(state: AgentState, config: RunnableConfig) -> dict:
                      [info_a.get("name", a), info_b.get("name", b)]
             return {
                 "history": [{"speaker": "system", "content": f"【系统】{'、'.join(absent)} 不在 {scene}，没法让他们在这里交谈。"}],
+                "last_player_action": None,
             }
         topic = msg
 
@@ -114,17 +120,14 @@ async def p2p_node(state: AgentState, config: RunnableConfig) -> dict:
     if is_bg:
         ui_events.append({"type": "npc_chat_start", "npc_ids": [a, b], "names": [name_a, name_b]})
 
-    # 调用新建的 P2P 博弈执行器
-    from multi_party_chat import multi_party_chat
-    _chat_result = await multi_party_chat(
-        participants=[a, b],
-        topic=topic,
-        max_rounds=2, # 仅让 A 和 B 各说一句，避免刷屏
-        state=state
-    )
-    
-    transcript = _chat_result.get("transcript", "")
-    memory_patches = _chat_result.get("memory_patches", {})
+    # 简单双向对话：A 开口一句，B 回应一句（气泡展示，不做群像博弈）
+    prompt_a = _role_block(info_a, a) + f"\n\n[话题] {topic}\n\n请以{name_a}的身份，对{name_b}说一句话（40字内），不要加任何标签。"
+    line_a, _ok_a = await _npc_talk(prompt_a)
+    prompt_b = _role_block(info_b, b) + f"\n\n[对方{name_a}刚对你说] {line_a}\n\n请以{name_b}的身份，回一句话（40字内），不要加任何标签。"
+    line_b, _ok_b = await _npc_talk(prompt_b)
+
+    transcript = f"{name_a}：{line_a}\n{name_b}：{line_b}"
+    memory_patches = {a: [f"{name_b}对我说：{line_b}"], b: [f"{name_a}对我说：{line_a}"]}
 
     # 回写记忆
     npcs_patch = {}
@@ -146,7 +149,7 @@ async def p2p_node(state: AgentState, config: RunnableConfig) -> dict:
     if is_bg:
         for _nid in [a, b]:
             _info = npcs.get(_nid) or {}
-            _cleaned = [pi for pi in (_info.get("pending_intent") or []) if pi.get("kind") != "chat"]
+            _cleaned = [pi for pi in (_info.get("pending_intent") or []) if pi.get("kind") not in ("chat", "bg_chat")]
             npcs_patch.setdefault(_nid, {})["pending_intent"] = _cleaned
 
     # 解析 transcript 为历史记录格式
@@ -182,53 +185,12 @@ async def p2p_node(state: AgentState, config: RunnableConfig) -> dict:
         out["ui_events"] = ui_events
     if is_bg:
         out["bg_chat_targets"] = []
-    # 只有前台显式触发才推进时间，后台触发由 time_node 已经推进过了
+    # 时间推进统一交给 time_node（前台 p2p 走 fan_out_action → ... → time_node；后台 bg_chat 直达 story_keeper）
+    # 前台 p2p 视为"步"指令：返回 last_player_action 触发旁观并发；后台 bg_chat 不广播
     if not is_bg:
-        _tp = time_advance(state)
-        if _tp:
-            _tp_hist = _tp.pop("history", None)
-            old_p = float(state.get("time_progress") or 0.0)
-            new_p = float(_tp.get("time_progress") or old_p)
-            _te = apply_time_events(state, old_p, new_p)
-            _te_hist = _te.pop("history", None) if _te else None
-            out.update(_tp)
-            if _te:
-                out.update(_te)
-            merged_hist = list(out.get("history") or [])
-            if _tp_hist:
-                merged_hist.extend(_tp_hist)
-            if _te_hist:
-                merged_hist.extend(_te_hist)
-            if merged_hist:
-                out["history"] = merged_hist
-
-            new_tick = int(state.get("world_tick") or 0) + 1
-            out["world_tick"] = new_tick
-            
-            from npc_life_tick import update_npc_life
-            _life = await update_npc_life(state, new_tick)
-            if _life:
-                _life_npcs = _life.pop("npcs", None)
-                out.update(_life)
-                if _life_npcs:
-                    out.setdefault("npcs", {}).update(_life_npcs)
-
-            # 消费未完成意图缓存
-            from utils import tick_pending
-            _pending = tick_pending({**state, "world_tick": new_tick})
-            if _pending:
-                _p_npcs = _pending.pop("npcs", None)
-                if _p_npcs:
-                    existing = out.setdefault("npcs", {})
-                    for _nid, _patch in _p_npcs.items():
-                        if _nid in existing and isinstance(existing[_nid], dict):
-                            existing[_nid] = {**existing[_nid], **_patch}
-                        else:
-                            existing[_nid] = _patch
-                if "ui_events" in _pending:
-                    out.setdefault("ui_events", []).extend(_pending["ui_events"])
-                if "world_events" in _pending:
-                    out.setdefault("world_events", []).extend(_pending["world_events"])
+        out["history"] = [{"speaker": "user", "content": msg}] + history_msgs
+        out["last_player_action"] = {"action": "p2p", "target": f"{name_a}和{name_b}的对话", "scene": scene}
+        out["active_targets"] = [a, b]
     # 写入 RAG
     try:
         from rag_manager import add_npc_dialog

@@ -3,6 +3,7 @@
 """
 import random
 from state import AgentState
+from constants import VALID_INTENT_KINDS
 
 
 async def arbiter_node(state: AgentState) -> dict:
@@ -53,8 +54,13 @@ async def arbiter_node(state: AgentState) -> dict:
                         npc_wants_list.append(other_nid)
 
             if player_wants or npc_wants_list:
-                # 50% 概率 NPC 胜出
-                if random.random() < 0.5:
+                # 50% 概率 NPC 胜出，impulsivity 高的 NPC 更可能冲动争抢
+                _imp = float(info.get("impulsivity", 0.5) or 0.5)
+                _win_chance = 0.5 + (_imp - 0.5) * 0.3  # impulsivity 0→0.35, 1→0.65
+                if random.random() < _win_chance:
+                    # NPC 赢了，往下走执行拿取
+                    pass
+                else:
                     # NPC 输了
                     _tags = list(info.get("emotion_tags") or [])
                     _tags.append({"target": "玩家", "tag": "被抢先", "tick": int(state.get("world_tick") or 0)})
@@ -62,9 +68,6 @@ async def arbiter_node(state: AgentState) -> dict:
                         _tags = _tags[-5:]
                     patches[nid] = {"current_intent": None, "emotion_tags": _tags}
                     continue
-                else:
-                    # NPC 赢了，往下走执行拿取
-                    pass
 
             scenes = state.get("scenes") or {}
             scene_items = (scenes.get(npc_scene) or {}).get("items") or []

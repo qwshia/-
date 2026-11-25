@@ -122,43 +122,6 @@ def _parse_npc_move(msg: str, avail: list) -> str | None:
                 if cand == s or cand in s or s in cand:
                     return s
     return None
-def _parse_player_give(msg: str, player_items: list) -> str | None:
-    """玩家把背包物品交给当前 NPC。协议：!@N 给 X（前端拖拽拼出）。
-    兼容「把 X 给你」「给你 X」「X 给你」；「给我」「给我 X」不算（那是反向 give_item）。返回背包中匹配到的物品名；未匹配返回 None。"""
-    if not msg:
-        return None
-    items = [str(x) for x in (player_items or []) if x]
-    if not items:
-        return None
-    text = msg.strip()
-    has_gei_wo = bool(re.search(r"(?:给|交给|递给|送)\s*我", text))
-    has_gei_npc = bool(re.search(r"(?:给|交给|递给|送)\s*(?:你|您|ta|TA|她|他)", text))
-    if has_gei_wo and not has_gei_npc:
-        return None
-
-    cands = []
-    m = re.match(r"^(?:给|交给|递给|送)\s*([\u4e00-\u9fa5A-Za-z0-9（）()]{1,12})\s*$", text)
-    if m:
-        cands.append(m.group(1).strip(_ATTIRE_STRIP))
-    m = re.search(r"(?:把|将)\s*([\u4e00-\u9fa5A-Za-z0-9（）()]{1,12})\s*(?:给|交给|递给|送)\s*(?:你|您|ta|TA|她|他)", text)
-    if m:
-        cands.append(m.group(1).strip(_ATTIRE_STRIP))
-    m = re.search(r"(?:给|交给|递给|送)\s*(?:你|您|ta|TA|她|他)\s*([\u4e00-\u9fa5A-Za-z0-9（）()]{1,12})", text)
-    if m:
-        cands.append(m.group(1).strip(_ATTIRE_STRIP))
-    m = re.search(r"([\u4e00-\u9fa5A-Za-z0-9（）()]{1,12})\s*(?:给|交给|递给|送)\s*(?:你|您|ta|TA|她|他)", text)
-    if m:
-        cands.append(m.group(1).strip(_ATTIRE_STRIP))
-
-    for cand in cands:
-        if not cand:
-            continue
-        if cand in items:
-            return cand
-        for it in items:
-            if cand in it or it in cand:
-                return it
-    return None
 
 
 _ATTIRE_PREFIXES = ("外罩", "内穿", "身着", "穿着", "足蹬", "头戴", "手持", "披着", "套着", "外披", "内衬")
@@ -234,3 +197,66 @@ def _is_npc_command(msg: str) -> bool:
 def _strip_npc_cmd_prefix(msg: str) -> str:
     """剥掉 !令 @N 前缀，返回剩余内容（给 _parse_* 识别与 prompt 用）。"""
     return _NPC_CMD_PREFIX.sub("", msg or "", count=1).strip()
+
+
+_STEAL_VERB_RE = re.compile(r"^(?:偷|窃取|顺走|拿走)\s*")
+
+
+def _parse_steal_cmd(msg: str) -> dict | None:
+    """解析偷窃指令。返回 {"npc_name": str, "item_name": str} 或 None。
+    支持格式：
+      - !偷 NPC名          → {"npc_name": "NPC名", "item_name": ""}（随机偷该 NPC 一件）
+      - !偷 物品名         → {"npc_name": "", "item_name": "物品名"}（由 item_node 兜底按物品名匹配）
+      - !偷 NPC名 物品名   → 两者都指定
+    单参数统一先当 npc_name（前端「偷」按钮发的是 NPC 名）；item_node 会按在场 NPC 名兜底判断。"""
+    if not msg:
+        return None
+    text = msg.lstrip().lstrip("!！").strip()
+    m = _STEAL_VERB_RE.match(text)
+    if not m:
+        return None
+    rest = text[m.end():].strip()
+    if not rest:
+        return None
+    parts = rest.split()
+    if len(parts) == 1:
+        return {"npc_name": parts[0].strip(_ATTIRE_STRIP), "item_name": ""}
+    npc_name = parts[0].strip(_ATTIRE_STRIP)
+    item_name = parts[-1].strip(_ATTIRE_STRIP)
+    if not item_name:
+        return None
+    return {"npc_name": npc_name, "item_name": item_name}
+
+
+_PROBE_WORDS = ("套话", "套你话", "逼问", "追问", "审问", "盘问", "质问", "试探", "施压", "逼供", "威胁")
+
+
+_USE_RE = re.compile(r"^[!！]\s*使用\s*([\u4e00-\u9fa5A-Za-z0-9（）()]{1,12})")
+
+
+def _parse_use_cmd(msg: str) -> dict | None:
+    """解析道具使用指令：!使用 道具 [对 目标]。
+    返回 {"item": "道具名", "target": "目标名"} 或 None。"""
+    if not msg:
+        return None
+    text = msg.lstrip().lstrip("!！").strip()
+    if not text.startswith("使用"):
+        return None
+    body = text[2:].strip()
+    if not body:
+        return None
+    item_name = ""
+    target = ""
+    if "对" in body:
+        left, _, right = body.partition("对")
+        item_name = left.strip(_ATTIRE_STRIP)
+        target = right.strip(_ATTIRE_STRIP)
+    elif "给" in body:
+        left, _, right = body.partition("给")
+        item_name = left.strip(_ATTIRE_STRIP)
+        target = right.strip(_ATTIRE_STRIP)
+    else:
+        item_name = body.strip(_ATTIRE_STRIP)
+    if not item_name:
+        return None
+    return {"item": item_name, "target": target}

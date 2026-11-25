@@ -78,7 +78,6 @@ def fan_out(state: AgentState):
         "time_turns": state.get("time_turns", 0),
         "props": state.get("props", []),
         "scenes": state.get("scenes", {}),
-        "player_attire": state.get("player_attire", "普通衣着"),
         "player_intent": state.get("player_intent") or {},
         "player_name": state.get("player_name", ""),
         "item_desc_map": state.get("item_desc_map", {}),
@@ -94,4 +93,47 @@ def fan_out(state: AgentState):
         is_observer = nid not in targets
         sends.append(Send("npc_worker", {"npc_id": nid, "is_observer": is_observer, **snapshot}))
         
+    return sends
+
+
+def fan_out_action(state: AgentState):
+    """动作广播引发并发：唤醒同场景除本轮焦点外的所有 NPC（p2p 双主角、已直接对话的 NPC 不再重复发言）"""
+    scene = state.get("current_scene", "")
+    npcs = state.get("npcs") or {}
+    _excluded = set(state.get("active_targets") or [])
+    present = [nid for nid, info in npcs.items() if info.get("location") == scene and nid not in _excluded]
+    
+    if not present:
+        return "time_node"
+        
+    snapshot = {
+        "npcs": state.get("npcs"),
+        "current_scene": scene,
+        "history": state.get("history", []),
+        "user_msg": state.get("user_msg", ""),
+        "last_player_action": state.get("last_player_action"),
+        "global_truth": state.get("global_truth", ""),
+        "player_revealed_clues": state.get("player_revealed_clues", []),
+        "world_events": state.get("world_events", []),
+        "player_items": state.get("player_items", []),
+        "available_scenes": state.get("available_scenes", []),
+        "time_phase": state.get("time_phase", ""),
+        "time_start": state.get("time_start", ""),
+        "time_limit": state.get("time_limit", ""),
+        "time_progress": state.get("time_progress", 0.0),
+        "time_turns": state.get("time_turns", 0),
+        "props": state.get("props", []),
+        "scenes": state.get("scenes", {}),
+        "player_intent": state.get("player_intent") or {},
+        "player_name": state.get("player_name", ""),
+        "item_desc_map": state.get("item_desc_map", {}),
+        "p2p_transcript": state.get("p2p_transcript", ""),
+        "opened_scenes": state.get("opened_scenes", []),
+        "analysis_counter": state.get("analysis_counter", 0),
+        "last_clue_idx": state.get("last_clue_idx", 0),
+    }
+    
+    sends = []
+    for nid in present:
+        sends.append(Send("npc_worker", {"npc_id": nid, "is_observer": True, **snapshot}))
     return sends

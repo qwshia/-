@@ -11,8 +11,8 @@ from stream_bus import inc_registered, push_chunk, push_end, push_start
 from parsing import _apply_attire, _is_npc_command, _strip_npc_cmd_prefix
 from npc_utils import parse_npc_output
 from rag_manager import search_npc_dialog, add_npc_dialog
-from item_utils import key_owner_npc, split_keys, player_has_key, prop_location, key_name_of
-from utils import _parse_content, _format_attire, _get_item_names
+from item_utils import prop_location, key_name_of, bio_holder_of, unlock_hint
+from utils import _format_attire, _get_item_names
 
 
 def _safe_int(v, default=0):
@@ -35,13 +35,25 @@ def _cut_at_marks(s: str, is_ripple_phase: bool = False) -> str:
     return s[:cut]
 
 
-async def _npc_respond(prompt: str, npc_id: str, requested_items=None) -> tuple:
+def _fact_spoken(fact: str, content: str) -> bool:
+    """判断秘密事实是否真的被 NPC 说进了本轮台词（而不是只触发后台判定）。"""
+    fact = (fact or "").strip()
+    content = (content or "").strip()
+    if not fact or not content:
+        return False
+    # 取事实中长度>=2 的独立片段，命中一半以上即认为已说出
+    tokens = [t for t in re.split(r"[，。；、,.;:：\s]+", fact) if len(t) >= 2]
+    if not tokens:
+        return fact in content
+    hits = sum(1 for t in tokens if t in content)
+    return hits >= max(1, int(len(tokens) * 0.5))
+
+
+async def _npc_respond(prompt: str, npc_id: str, requested_items=None, thread_id: str = "") -> tuple:
     inc_registered()
     await push_start(npc_id)
     full = ""
-    pushed_ripple = 0
-    pushed_main = 0
-    main_start = None  # 主响应起点位置指针（None 表示余波尚未切分）
+    pushed = 0
     half_beat_done = False
     try:
         async for chunk in actor_llm.astream([HumanMessage(content=prompt)]):
@@ -49,56 +61,36 @@ async def _npc_respond(prompt: str, npc_id: str, requested_items=None) -> tuple:
             if not t:
                 continue
             full += t
-
-            # 余波尚未切分时，只认 |||RIPPLE||| 分隔符（流式阶段不做括号兜底）
-            if main_start is None:
-                m_sep = re.search(r"\|\|\|\s*RIPPLE", full, re.IGNORECASE)
-                if m_sep:
-                    m_full_sep = re.match(r"\|\|\|\s*RIPPLE\s*\|\|\|?", full[m_sep.start():], re.IGNORECASE)
-                    if m_full_sep:
-                        # 关键：ripple_text 也要经过 _cut_at_marks，清洗残留标签
-                        ripple_text = _cut_at_marks(full[:m_sep.start()], is_ripple_phase=False)
-                        if len(ripple_text) > pushed_ripple:
-                            await push_chunk(npc_id, ripple_text[pushed_ripple:])
-                            pushed_ripple = len(ripple_text)
-                        main_start = m_sep.start() + m_full_sep.end()
-
-            # 已确定主响应起点，推送主响应
-            if main_start is not None:
-                if not half_beat_done:
-                    half_beat_done = True
-                    await asyncio.sleep(0.8)
-                main_text = full[main_start:]
-                # 废除流式阶段的截断，将文本全部推送，保证终端完整显示
-                if len(main_text) > pushed_main:
-                    await push_chunk(npc_id, main_text[pushed_main:])
-                    pushed_main = len(main_text)
-
-        # 兜底：模型完全没按格式输出，整段当主响应推出去
-        if main_start is None and full.strip():
-            if not half_beat_done:
+            # 一段话回复：清洗可能残留的 RIPPLE 分隔符后整段推送
+            safe = re.sub(r"\|\|\|\s*RIPPLE\s*\|\|\|?", "", full, flags=re.IGNORECASE)
+            safe = _cut_at_marks(safe)
+            if not half_beat_done and safe.strip():
                 half_beat_done = True
-                await asyncio.sleep(0.8)
-            # 先剥离可能存在的残留分隔符，避免 _cut_at_marks 因为 | 号误伤主响应
-            cleaned_full = re.sub(r"\|\|\|\s*RIPPLE\s*\|\|\|?", "", full, flags=re.IGNORECASE)
-            safe_full = _cut_at_marks(cleaned_full, is_ripple_phase=False)
-            if len(safe_full) > pushed_main:
-                await push_chunk(npc_id, safe_full[pushed_main:])
-                pushed_main = len(safe_full)
+                await asyncio.sleep(0.6)
+            if len(safe) > pushed:
+                await push_chunk(npc_id, safe[pushed:])
+                pushed = len(safe)
 
         await push_end(npc_id)
     except Exception:
         await push_end(npc_id)
-        return "（网络异常，没有说话。）", False, 0, False, [], [], None, [], [], ""
+        return "（网络异常，没有说话。）", False, 0, False, [], [], None, [], [], "", None
 
     parsed = parse_npc_output(full)
     content = parsed["content"]
     ripple = parsed.get("ripple", "")
     aff_change = parsed["aff_change"]
     consent = parsed["consent"]
-    consented_items = parsed["consented_items"] if consent else list(requested_items or [])
 
-    if not consent and not parsed["consented_items"]:
+    # 同意判定修正：consent=True 才给物；do_items 指定给哪些，do:y 无 do_items 时默认给全部索要物品。
+    # 之前这里"拒绝却把 requested_items 全塞进 consented_items"导致拒绝被判成同意（bug）。
+    if consent:
+        consented_items = list(parsed["consented_items"]) if parsed["consented_items"] else list(requested_items or [])
+    else:
+        consented_items = []
+
+    # 文本兜底：标签判了拒绝，但台词明确说"给你/拿去"时，仍按同意处理
+    if not consent and not consented_items:
         if any(w in full for w in ("给你", "拿去", "拿去吧", "这就给")):
             consent = True
             consented_items = list(requested_items or [])
@@ -115,54 +107,17 @@ async def npc_worker(state: AgentState, config: RunnableConfig) -> dict:
     if info.get("location") != scene:
         return {}
 
+    # NPC 状态检查：dead/absent 不回应
+    _npc_status = str(info.get("status", "alive") or "alive").strip().lower()
+    if _npc_status in ("dead", "absent"):
+        return {}
+
     user_msg = state.get("user_msg", "")
 
     is_observer = state.get("is_observer", False)
     if is_observer:
-        # 提取场景信息和在场人物给旁观者
-        all_npcs = state.get("npcs") or {}
-        present_names = [i.get("name", "") for i in all_npcs.values() if i.get("location") == scene and i.get("name")]
-        present_txt = "、".join(present_names)
-        
-        # 提取最近两轮历史
-        history = state.get("history") or []
-        recent_hist = ""
-        for h in history[-4:]:
-            sp = h.get("speaker")
-            if sp == "user":
-                recent_hist += f"玩家：{h.get('content')}\n"
-            elif sp in all_npcs:
-                recent_hist += f"{all_npcs[sp].get('name')}：{h.get('content')}\n"
-
-        obs_prompt = f"""你是互动叙事中的旁观者 NPC。你的名字是 {info.get('name', npc_id)}，身份是 {info.get('role', '路人')}，性格 {info.get('personality', '普通')}。
-你当前所在的场景是：{scene}。
-当前房间内的人有：{present_txt}。
-最近发生的事：
-{recent_hist}
-
-玩家刚刚说/做了：{user_msg}
-
-请写出你作为旁观者的本能反应。
-【铁律】
-1. 如果你觉得事不关己，只输出 `(发呆)`，系统会自动过滤你。
-2. 如果你想插嘴，只能有一句极短的台词，总字数不超过 30 字。
-3. 【绝对禁令】严禁输出任何英文、代码、乱码或无逻辑的文字！如果不知道说什么，直接输出 `(发呆)`。
-4. 不要输出任何标签格式（如 aff/options）。
-格式：`(动作/神态) 台词` 或 `(动作/神态)`"""
-        try:
-            resp = await actor_llm.ainvoke([HumanMessage(content=obs_prompt)])
-            obs_content = (resp.content or "").strip()
-        except Exception:
-            obs_content = "(发呆)"
-            
-        if not obs_content or "发呆" in obs_content or "无反应" in obs_content:
-            return {}
-            
-        # 返回旁观者的反应
-        return {
-            "history": [{"speaker": npc_id, "content": obs_content}],
-            "ui_events": [{"type": "observer_reaction", "npc_id": npc_id, "npc_name": info.get("name", npc_id), "text": obs_content}]
-        }
+        from bystander_node import bystander_worker
+        return await bystander_worker(state, config)
 
     is_cmd = _is_npc_command(user_msg)
     if is_cmd:
@@ -225,38 +180,69 @@ async def npc_worker(state: AgentState, config: RunnableConfig) -> dict:
     else:
         attire = {}
     attire_text = _format_attire(attire)
-    traits = info.get("personality_traits") or []
-    core_goal = info.get("core_goal") or {}
-    short_term_goal = info.get("short_term_goal") or {}
+    core_drive = info.get("core_drive") or {}
+    short_term_plan = info.get("short_term_plan") or {}
     mood = info.get("mood") or {}
     daily_routine = info.get("daily_routine") or []
     life_events = info.get("life_events") or []
     current_action = info.get("current_action") or {}
+    cognition = info.get("cognition") or []
+    fears = info.get("fears") or []
+    desires = info.get("desires") or []
+    perspective = str(info.get("perspective", "") or "").strip()
+    contradictions = info.get("contradictions") or []
+    impulsivity = info.get("impulsivity", 0.5)
+    # 从 cognition 中提取个人经历作为关键记忆
+    _key_mem_entries = [c for c in cognition if isinstance(c, dict) and c.get("content") and (
+        (c.get("type") == "secret" and not c.get("reveal_condition")) or
+        (c.get("type") == "fact")
+    )]
+    key_memories_txt = "；".join([f"{c.get('content', '')}" for c in _key_mem_entries]) or "（无）"
+    status = str(info.get("status", "alive") or "alive").strip()
 
-    traits_txt = "、".join([f"{t.get('trait', '')}(强度{t.get('intensity', 50)})" for t in traits if isinstance(t, dict)]) or "（无明确特质）"
-    core_goal_txt = f"长期执念：{core_goal.get('goal', '')}" if core_goal else "（无长期执念）"
-    short_goal_txt = f"近期盘算：{short_term_goal.get('goal', '')}" if short_term_goal else "（无近期盘算）"
-    mood_txt = f"当前情绪：{mood.get('current', '平静')}（原因：{mood.get('reason', '')}）"
+    core_drive_txt = f"长期执念：{core_drive.get('goal', '')}（服务：{core_drive.get('serves', 'self')}，优先级：{core_drive.get('priority', 100)}）" if core_drive and core_drive.get("goal") else "（无长期执念）"
+    short_plan_txt = f"近期盘算：{short_term_plan.get('goal', '')}" if short_term_plan and short_term_plan.get("goal") else "（无近期盘算）"
+    mood_txt = f"当前情绪：{mood.get('current', '平静')}（原因：{mood.get('reason', '')}，稳定性：{mood.get('stability', 'stable')}）"
     action_txt = current_action.get("action", "") or "发呆"
     routine_txt = "；".join([f"{r.get('phase', '')}: {','.join(r.get('actions', []))}" for r in daily_routine if isinstance(r, dict)]) or "（无）"
     recent_life = "；".join([str(e.get('event', '')) for e in life_events[-5:] if isinstance(e, dict)]) or "（无）"
+
+    # cognition 提取
+    _cog_facts = [str(c.get("content", "")).strip() for c in cognition if isinstance(c, dict) and c.get("type") == "fact" and c.get("content")]
+    _cog_secrets = [c for c in cognition if isinstance(c, dict) and c.get("type") == "secret" and c.get("content")]
+    _cog_beliefs = [c for c in cognition if isinstance(c, dict) and c.get("type") == "belief" and c.get("content")]
+    _cog_forbidden = [c for c in cognition if isinstance(c, dict) and c.get("type") == "forbidden" and c.get("content")]
+
+    facts_txt = "\n".join(f"- {c}" for c in _cog_facts) or "（无）"
+    secrets_txt = "\n".join(f"- {c.get('content', '')}（透露条件：{c.get('reveal_condition', '无')}）" for c in _cog_secrets) or "（无）"
+    beliefs_txt = "\n".join(f"- {c.get('content', '')}（置信度：{c.get('confidence', 50)}%）" for c in _cog_beliefs) or "（无）"
+    forbidden_txt = "\n".join(f"- {c.get('content', '')}（原因：{c.get('reason', '不愿透露')}）" for c in _cog_forbidden) or "（无）"
+    fears_txt = "、".join(str(f).strip() for f in fears if str(f).strip()) or "（无）"
+    desires_txt = "、".join(str(d).strip() for d in desires if str(d).strip()) or "（无）"
+    contradictions_txt = "；".join(str(c).strip() for c in contradictions if str(c).strip()) or "（无）"
     
-    flesh_section = f"""\n[人物特质] {traits_txt}
-【表演铁律】特质影响你的“表演方式”，不影响“做不做”。比如多疑的人同意了也会先试探、答应得勉强、嘴上答应手上不动。
-[当前状态] {mood_txt} | 你此刻正在：{action_txt}
+    flesh_section = f"""\n[人物特质] {personality}
+【表演铁律】性格影响你的“表演方式”，不影响“做不做”。比如多疑的人同意了也会先试探、答应得勉强、嘴上答应手上不动。
+[当前状态] {mood_txt} | 你此刻正在：{action_txt} | 身体状态：{physical_state} | 状态：{status}
 你的日常习惯：{routine_txt}
 [近期经历] {recent_life}
-[心里盘算] {core_goal_txt}；{short_goal_txt}
+[关键记忆] {key_memories_txt}
+[心里盘算] {core_drive_txt}；{short_plan_txt}
+[认知状态]
+确知事实：{facts_txt}
+秘密：{secrets_txt}
+推断/信念：{beliefs_txt}
+拒绝话题：{forbidden_txt}
+[恐惧] {fears_txt}
+[渴望] {desires_txt}
+[内在矛盾] {contradictions_txt}
+[解读倾向] {perspective or '（无特殊倾向）'}
 """
-    goal = info.get("goal", "")
-    secrets = [str(s) for s in (info.get("secrets") or [])]
-    forbidden = [str(f) for f in (info.get("forbidden") or [])]
-    hallucinations = [str(h) for h in (info.get("hallucinations") or [])]
+    goal = info.get("goal", "") or info.get("life_goal", "")
     aff = _safe_int(info.get("affection", 100), 100)
 
     _weak = info.get("weakness") if isinstance(info.get("weakness"), dict) else {}
     weakness_trigger = str(_weak.get("trigger", "") or "").strip()
-    weakness_type = str(_weak.get("type", "") or "").strip()
     weakness_reaction = str(_weak.get("reaction", "") or "").strip()
     weakness_state = str(_weak.get("state", "closed") or "closed").strip()
     weakness_kws = _weak.get("trigger_keywords") if isinstance(_weak.get("trigger_keywords"), list) else []
@@ -272,9 +258,33 @@ async def npc_worker(state: AgentState, config: RunnableConfig) -> dict:
     props = state.get("props") or []
     private_items = [p.get("name") for p in props if p.get("holder") == name and p.get("name")]
     private_txt = "、".join(private_items) if private_items else "（无）"
-    secrets_txt = "\n".join(f"- {s}" for s in secrets) or "（无）"
-    forbidden_txt = "\n".join(f"- {f}" for f in forbidden) or "（无）"
-    hallucinations_txt = "\n".join(f"- {h}" for h in hallucinations) or "（无）"
+
+    # ==== 秘密后台松口判定（无显式触发词：好感/关系/递物/话题命中自然累积，动态判定）====
+    _secret_objs = [c for c in _cog_secrets]  # cognition 中 type=="secret" 的条目
+    _revealed_facts = {str(r.get("fact", "") or "").strip() for r in (state.get("secrets_revealed") or []) if isinstance(r, dict) and r.get("npc") == name}
+    _available_secrets = [s for s in _secret_objs if str(s.get("content", "") or "").strip() not in _revealed_facts]
+    probe_outcome = None  # {"reveal": dict} 或 None（未松口则不注入任何东西，NPC 正常对话）
+    probe_section = ""
+    if _available_secrets:
+        import random as _random
+        _weak_broken = weakness_state == "broken"
+        _bribed = bool(offered_items)
+        _p = 0.02  # 背景松口率：关系升温、聊得多了，NPC 自然漏出秘密
+        _p += max(0.0, (aff - 80) / 300.0)  # 好感：80→0，230→+0.5
+        if _weak_broken:
+            _p += 0.6
+        if _bribed:
+            _p += 0.3
+        # 玩家话语命中该秘密的透露条件（如"欠债""孩子"），显著提高松口概率
+        _cond = str(_available_secrets[0].get("reveal_condition", "") or "")
+        if _cond:
+            _cond_words = [w for w in re.split(r"[,，。;；、\s]+", _cond) if len(w) >= 2]
+            _hit_n = sum(1 for w in _cond_words if w in (clean_msg or user_msg or ""))
+            if _hit_n >= 2:
+                _p += 0.35
+        _p = min(0.95, max(0.0, _p))
+        if _random.random() < _p:
+            probe_outcome = {"reveal": _available_secrets[0]}
 
     player_name = state.get("player_name", "")
     player_location = scene
@@ -288,18 +298,15 @@ async def npc_worker(state: AgentState, config: RunnableConfig) -> dict:
     if move_target and move_target not in available_scenes:
         move_target = None
     if move_target:
-        rk = str((state.get("scenes") or {}).get(move_target, {}).get("requires_key", "") or "").strip()
-        if rk:
-            need = [k.strip() for k in rk.split("+") if k.strip()]
-            if move_target in (state.get("opened_scenes") or []):
-                need = []
-            player_items = _get_item_names(state.get("player_items") or [])
-            missing = [k for k in need if k not in player_items]
-            if missing:
-                npc_has = all(any(p.get("name") == k and p.get("holder") == name for p in props) for k in missing)
-                if not npc_has:
-                    move_blocked = True
-                    move_target = None
+        _sdef = (state.get("scenes") or {}).get(move_target, {})
+        if _sdef.get("locked") and move_target not in (state.get("opened_scenes") or []):
+            _kn = str(_sdef.get("key_name", "") or "").strip()
+            _bh = str(_sdef.get("bio_holder", "") or "").strip()
+            _has_key = bool(_kn and any(p.get("name") == _kn and p.get("holder") == name for p in props))
+            _self_bio = bool(_bh and _bh == name)
+            if _kn and not _has_key and not _self_bio:
+                move_blocked = True
+                move_target = None
 
     props = state.get("props") or []
     scenes = state.get("scenes") or {}
@@ -348,10 +355,6 @@ async def npc_worker(state: AgentState, config: RunnableConfig) -> dict:
                         _pos = f"在{_p.get('location', '某处')}"
                     lookup_lines.append(f"物品「{_p.get('name')}」：{_p.get('desc','')}，{_pos}")
     _all_names = set(items) | {p.get("name") for p in props if p.get("name")} | set(_snap_items)
-    for _cp in props:
-        for _c in (_parse_content(_cp.get("content")) or []):
-            if _c.get("name"):
-                _all_names.add(str(_c.get("name")).strip())
     for nm in _all_names:
         if nm and nm in user_msg and nm not in offered_items:
             if nm in _snap_items:
@@ -380,21 +383,8 @@ async def npc_worker(state: AgentState, config: RunnableConfig) -> dict:
                     lookup_lines.append(f"物品「{nm}」：这是{_holder}的东西，{_pos}，具体用途不详")
                 else:
                     lookup_lines.append(f"物品「{nm}」：{pp.get('desc','')}，持有者{_holder}，{_pos}")
-                _parsed_c = _parse_content(pp.get("content"))
-                if _parsed_c:
-                    _sub = "；".join(f"{c['name']}" + (f"：{c['text']}" if c.get("text") else "") for c in _parsed_c)
-                    lookup_lines.append(f"（内含：{_sub}）")
             else:
-                _container = None
-                for _cp in props:
-                    _subs = _parse_content(_cp.get("content"))
-                    if any(str(c.get("name", "")).strip() == nm for c in _subs):
-                        _container = _cp.get("name")
-                        break
-                if _container:
-                    lookup_lines.append(f"物品「{nm}」：在「{_container}」内部")
-                else:
-                    lookup_lines.append(f"物品「{nm}」：{desc_map.get(nm, '')}")
+                lookup_lines.append(f"物品「{nm}」：{desc_map.get(nm, '')}")
     if offered_items:
         for _oi in offered_items:
             _od = str(desc_map.get(_oi, "") or "").strip()
@@ -402,11 +392,7 @@ async def npc_worker(state: AgentState, config: RunnableConfig) -> dict:
             _status = ""
             if _o_prop:
                 if _o_prop.get("locked"):
-                    _kn = str(_o_prop.get("key_name", "") or "").strip()
-                    if _kn:
-                        _status = f"（物品锁着，需要{_kn}才能打开）"
-                elif _o_prop.get("content"):
-                    _status = "（物品内含内容）"
+                    _status = f"（{unlock_hint(_o_prop)}）"
             _full = _od
             if _status and _status not in _full:
                 _full = (_full + _status) if _full else _status
@@ -429,6 +415,7 @@ async def npc_worker(state: AgentState, config: RunnableConfig) -> dict:
     if offered_items:
         items_txt = "、".join(offered_items)
         cmd_parts.append(f"- 玩家给你物品：{items_txt}")
+        cmd_parts.append(f"- 收礼好感：根据你对该物品的真实喜好/需求动态调整好感——喜欢+10~20，无感0，厌恶/嫌弃-5~-10，并在 [aff:] 标签中体现（收下物品≠必须涨好感）")
         
     if move_target:
         cmd_parts.append(f"- 前往地点：{move_target}")
@@ -460,7 +447,11 @@ async def npc_worker(state: AgentState, config: RunnableConfig) -> dict:
     if intent_type == "mixed":
         intent_section = "玩家的话里既有情绪也有指令，请先回应情绪，再根据人设决定是否执行指令。\n"
     elif intent_type == "command":
-        intent_section = "本轮以执行指令为主，回应尽量简短。\n"
+        intent_section = (
+            "【本轮为指令执行模式】玩家下达了明确的指令。主响应必须极简："
+            "只输出一句 25 字以内的简短应答（可带一个轻动作/神态），"
+            "禁止展开剧情对话、禁止长篇解释、禁止反问（若拒绝也要极简如「（摇头）我不去。」）。\n"
+        )
 
     # RAG 智障拦截：指令、极短句、动作类、索要/递交类不查记忆
     _skip_rag = (intent_type == "command") or (len(clean_msg) <= 4) or (move_target is not None) or bool(requested_items) or bool(offered_items) or bool(attire_change)
@@ -495,113 +486,118 @@ async def npc_worker(state: AgentState, config: RunnableConfig) -> dict:
                 "命中后你可以主动交出底牌，用 [surrender: 物品名] 标签交给玩家(仅限你实际持有的物品)；不交则不用该标签。\n"
             )
 
+    if probe_outcome and probe_outcome.get("reveal"):
+        _probe_fact = str(probe_outcome["reveal"].get("content", "") or "").strip()
+        probe_section = (
+            "\n[松口判定-你守不住了]\n"
+            f"聊到这份上，你的心理防线已松动/权衡后决定松口。你必须把下面这条秘密的核心信息直接说进本轮台词里（用第一人称，事实准确完整，不要省略关键信息）：{_probe_fact}\n"
+            "保持你的人设与情绪，让秘密顺着当前话题自然说出来，不要突兀广播。\n"
+        )
+
     if cmd_parts:
         tail_rules = """
-【尾部标签区（极度重要）】
-在主响应写完后，**必须另起一行**，统一输出所有标签，不要遗漏，不要分行：
-[aff:数字] [do:y 或 do:n 或 do_items: 物品A, 物品B] [options: 选项1 | 选项2 | 选项3] [intent: 类型 | 目标 | 细节]
+[尾部标签区-指令模式]
+主响应写完, 另起一行, 只输出以下两个标签:
+[aff:数字] [do:y|do:n|do_items: 物品A, 物品B]
+[禁令] 严禁 [options:] / [intent:]. 缺 [do:] 视为拒绝.
 
-【意图池（仅限这 6 种）】
-- [intent: idle] （发呆/无明确目标）
-- [intent: move | 目标场景名 | 细节]
-- [intent: take | 物品名 | 细节]
-- [intent: give | 物品名 | 细节]
-- [intent: put_on | 衣物名 | 细节] （主动穿上）
-- [intent: take_off | 衣物名 | 细节] （主动脱下）
-
-示例输出：
-(猛地一颤)
-|||RIPPLE|||
-(缓缓脱下外套，眼神死寂) 裴处长，这是您要的。
-[aff:-5] [do_items: 黑色西装] [options: 查看衬衫 | 命令跪下 | 拥抱她] [intent: idle]
+示例:
+好.
+[aff:5] [do:y]
 """
     else:
         tail_rules = """
-【尾部标签区（极度重要）】
-在主响应写完后，**必须另起一行**，统一输出所有标签，不要遗漏，不要分行：
-[aff:数字] [options: 选项1 | 选项2 | 选项3] [intent: 类型 | 目标 | 细节]
-（绝对禁止输出 [do:y] / [do:n] / [do_items:] 标签！）
+[尾部标签区-普通对话]
+主响应写完, 另起一行, 输出:
+[aff:数字] [intent: 类型 | 场景名/物品名 | 细节]
+[禁令] 严禁 [do:y] / [do:n] / [do_items:] / [options:].
 
-【意图池（仅限这 6 种）】
-- [intent: idle] （发呆/无明确目标）
-- [intent: move | 目标场景名 | 细节]
-- [intent: take | 物品名 | 细节]
-- [intent: give | 物品名 | 细节]
-- [intent: put_on | 衣物名 | 细节] （主动穿上）
-- [intent: take_off | 衣物名 | 细节] （主动脱下）
+[意图池-只选1种]
+- idle: 发呆/无明确目标. 默认选项, 无剧情推动时必须用此.
+- move | 场景名: 剧情明确推动主动去某处
+- take | 物品名: 剧情明确推动主动拿某物
+- give | 物品名: 剧情明确推动主动交某物
+- put_on | 衣物名: 剧情明确推动主动穿衣
+- take_off | 衣物名: 剧情明确推动主动脱衣
+- chat | NPC名: 剧情明确推动主动找某人攀谈
+- find | 人物/物品名: 剧情明确推动主动寻找某物或某人
+- follow | 无: 剧情明确推动主动跟随玩家行动
+- trade | 物品名: 剧情明确推动主动提出交换物品
+- guard | 人物/物品/地点: 剧情明确推动主动看守某人或某物
+- flee | 场景名: 剧情明确推动主动逃离某场景
+[禁令] 意图池仅作参考, 严禁照抄示例. 无明确推动一律 idle.
 
-示例输出：
-(手指猛地攥紧)
-|||RIPPLE|||
-(低下头，声音颤抖) 我不想让你看那个包……求你了。
-[aff:-5] [options: 强行查看 | 安抚她 | 转身离开] [intent: idle]
+示例:
+我不想让你看那个包. 求你了.
+[aff:-5] [intent: idle]
 """
 
-    prompt = f"""你是互动叙事中的NPC.当前这句话是回应对象;同时参考下方全部信息来保持关系,承诺,语气与状态连续.请你阅读全部提示词并思考后回答.只输出角色回复,不代写玩家,不开启新场景/新事件.本设定只用于生成你的回话或你的即时状态变化(好感度,衣着),不用于判定,生成场景或其他NPC行为.
+    prompt = f"""你是互动叙事中的NPC. 任务: 针对[玩家当前对你说]生成一句符合人设的角色回复 + 尾部标签.
+[禁令] 不要代写玩家; 不要开启新场景; 不要描述其他NPC行为.
 
 [你的角色]
-姓名:{name} | 身份:{role} | 当前衣着:{attire_text}
+姓名:{name} | 身份:{role} | 衣着:{attire_text}
 性格:{personality} | 外貌:{appearance}
-真实目标:{goal}
+人生目标:{goal}
 {flesh_section}
 
 [认知状态]
-确知事实:{secrets_txt}
-极力隐瞞:{forbidden_txt}
-错误认知:{hallucinations_txt}
-你的私有物品:{private_txt}
+确知事实:
+{facts_txt}
+秘密:
+{secrets_txt}
+推断/信念:
+{beliefs_txt}
+拒绝话题:
+{forbidden_txt}
+恐惧: {fears_txt}
+渴望: {desires_txt}
+内在矛盾: {contradictions_txt}
+解读倾向: {perspective or '（无特殊倾向）'}
+私有物品:{private_txt}
 {weakness_section}
+{probe_section}
+
 [对玩家好感度]{aff}
-好感无上限无下限:越高越顺从,主动;越低越冷淡,抗拒;远高于100时几乎不会推诿玩家的任何要求,仍须符合身份与当场场景.回复末尾用[aff:数字](单次不超过±20,平淡给0).
+好感无上下限. 越高越顺从主动, 越低越冷淡抗拒. 回复末尾必须给 [aff:数字], 单次≤±20, 平淡给0.
 
 [世界动态]
-当前时间:{time_phase}
-玩家名字:{player_name}
-玩家当前在:{player_location}
-你在此处:{npc_location}
-当前房间内还有:{present_txt}
-可去场景:{available_txt}
-当前场景物品:{scene_items_txt}
-你的私有物品:{private_txt}
+时间:{time_phase} | 玩家名:{player_name} | 玩家在:{player_location} | 你在:{npc_location}
+同场景NPC:{present_txt} | 可去场景:{available_txt}
+场景物品:{scene_items_txt} | 你的私有物品:{private_txt}
 最近世界事件:{recent_events}
 
 [历史记录]
 近期对话:
 {recent_dialogue}
 {rag_section}
+
 [查表规则]
-1. 查表结果是你唯一的事实依据。没查到的，一律以"不知道/没听过"回应，绝不瞎编。
-2. 提到他人物品，只陈述归属和位置，不透露具体内容。
-3. 询问物品用途时，在你身上且无锁可说明；有锁则说打不开。
-4. 【绝对铁律】如果 [本次检索结果] 明确说明该物品在你身上（持有者是你），你绝对、绝对、绝对不能撒谎说"不在我身上"、"早就不在了"、"我不知道"。你可以根据好感度拒绝交出（输出 [do:n]），但必须承认东西在你手里。
-5. 如果玩家索要的是场景物品（比如红木密匣），且该物品上了锁，请告诉玩家需要什么钥匙才能打开。
+1. 只能依据[本次检索结果]里的事实回答. 没查到的一律回"不知道/没听过", 绝不瞎编.
+2. 他人物品只陈述归属和位置, 不透露具体内容.
+3. 询问物品用途: 在你身上且无锁可说明; 有锁则说打不开.
+4. 若[本次检索结果]明确说该物品在你身上, 绝对不能撒谎说"不在我身上/早就不在了/我不知道". 你可以拒绝交出(输出[do:n]), 但必须承认东西在你手里.
+5. 若玩家要的是场景物品且上了锁, 请告知需要什么钥匙才能打开.
+6. [帮忙开锁] 若玩家递给你一个带生物锁的物品(提示语含"需要你本人验证"或"生物锁"), 而你恰好是其生物锁持有者: 你愿意时可在回复中输出同意(标签[do:y]+[do_items:物品名]), 系统会让你用自己的虹膜/指纹帮他打开; 不愿意则输出[do:n]并说明. 生物凭证长在自己身上, 谁也偷不走、索要不去.
 
 {lookup_section}
 
 [交互红线]
-1. 实体限制:严禁编造未登记的人物/物品/地点;动作只能发生在当前场景.
-2. 新鲜感:严禁复读上一轮的句式或神态,严禁连续使用万能词汇(如眼神闪烁),每次必须换新角度.
-3. 状态同步:动作必须基于当前真实衣着!若无衣物,严禁出现衣物摩擦描写.
+1. 严禁编造未登记的人物/物品/地点. 动作只能发生在当前场景.
+2. 严禁复读上一轮句式/神态, 严禁连续使用万能词(如'眼神闪烁'), 必须换新角度.
+3. 动作必须基于当前真实衣着. 若无衣物, 严禁出现衣物摩擦描写.
 
 {cmd_section}
 {intent_section}
 [玩家当前对你说]
 {user_msg}
 
-【输出格式绝对铁律】
-你必须**严格按照以下两段 + 尾部标签**输出。绝对不允许漏掉分隔符，绝对不允许把标签混在台词里！
-
-第一段（余波）：只写你听到玩家动作时的**简短本能反应**（如：`(抬起头)`、`(停下手里的动作)`），**绝对不能带有任何台词，绝对不能超过15个字，绝对不能带任何标签！**
-
-紧接着**必须另起一行**输出固定分隔符：
-`|||RIPPLE|||`
-
-第二段（主响应）：以角色口吻完整回答。格式:`(动作/神态) 说话内容`，字数控制在40~100字。
-
+[输出格式-一段话+尾部标签]
+主响应: 直接说台词, 自然口语, 一段话说完, 40-120字. 严禁用括号描写动作/神态/小动作, 严禁添加口头禅, 直接说话即可.
 {tail_rules}
-[注意]:如果玩家的输入包含问题,请务必先回答问题,再去处理指令。所有标签必须统一输出在最后一行，绝不允许与台词混在同一行。"""
+[注意] 玩家输入含问题时, 先回答问题再处理指令. 所有标签统一在最后一行, 绝不与台词混排."""
 
-    content, ok, aff_change, consent, consented_items, options, weakness_hit, surrender_items, emotion_tags, ripple, npc_intent = await _npc_respond(prompt, npc_id, requested_items)
+    content, ok, aff_change, consent, consented_items, _options, weakness_hit, surrender_items, emotion_tags, _ripple, npc_intent = await _npc_respond(prompt, npc_id, requested_items, thread_id)
     # 无显式指令时，强行清空所有指令标签，防止幻觉或越界
     if not is_cmd and not cmd_parts:
         consent = False
@@ -656,8 +652,6 @@ async def npc_worker(state: AgentState, config: RunnableConfig) -> dict:
         "round_count": (info.get("round_count") or 0) + (1 if ok else 0),
         "affection": max(-100, min(500, aff + aff_change)),
         "current_intent": npc_intent,
-        "last_ripple": ripple,
-        "last_options": list(options or []),
     }}
 
     ui_events = []
@@ -677,10 +671,6 @@ async def npc_worker(state: AgentState, config: RunnableConfig) -> dict:
         "history": [{"speaker": npc_id, "content": content}],
         "npcs": npc_patch,
     }
-    if ripple:
-        # 写入 ui_events 供前端/终端展示余波
-        ui_events.append({"type": "ripple", "npc_id": npc_id, "npc_name": name, "text": ripple})
-
     sys_msgs = []
 
     if weakness_trigger and ok:
@@ -693,7 +683,6 @@ async def npc_worker(state: AgentState, config: RunnableConfig) -> dict:
                 "type": "mental_break",
                 "npc_id": npc_id,
                 "npc_name": name,
-                "weakness_type": weakness_type,
                 "reaction": weakness_reaction,
             })  # 2D frontend
         elif weakness_hit is False and weakness_state != "broken":
@@ -703,22 +692,48 @@ async def npc_worker(state: AgentState, config: RunnableConfig) -> dict:
                 "npc_name": name,
             })  # 2D frontend
 
+    if probe_outcome and probe_outcome.get("reveal"):
+        _fact = str(probe_outcome["reveal"].get("content", "") or "").strip()
+        # 只有真的在聊天里说出口才算透露，才记入线索；同时按事实文本去重，避免同一条秘密重复进线索
+        if _fact_spoken(_fact, content):
+            _clue_text = f"秘密（{name}透露）：{_fact}"
+            _existing_clues = {str(c).strip() for c in (state.get("player_revealed_clues") or [])}
+            _existing_facts = {str(r.get("fact", "") or "").strip() for r in (state.get("secrets_revealed") or []) if isinstance(r, dict)}
+            if _fact not in _existing_facts:
+                out["secrets_revealed"] = [{"npc": name, "fact": _fact}]
+            if _clue_text not in _existing_clues:
+                out["player_revealed_clues"] = [_clue_text]
+            sys_msgs.append(f"【系统】{name}松口了，你得到一条秘密，已记入线索笔记。")
+            ui_events.append({"type": "secret_revealed", "npc_name": name})
+            # 从 cognition 中移除已透露的秘密（秘密已暴露，不再是秘密）
+            _revealed_secret_content = _fact
+            _updated_cog = [c for c in (info.get("cognition") or []) if not (isinstance(c, dict) and c.get("type") == "secret" and str(c.get("content", "")).strip() == _revealed_secret_content)]
+            # 如果秘密内容不完全匹配，按 reveal_condition 匹配
+            if len(_updated_cog) == len(info.get("cognition") or []):
+                _probe_entry = probe_outcome["reveal"]
+                _probe_content = str(_probe_entry.get("content", "")).strip()
+                _updated_cog = [c for c in (info.get("cognition") or []) if not (isinstance(c, dict) and c.get("type") == "secret" and str(c.get("content", "")).strip() == _probe_content)]
+            if len(_updated_cog) < len(info.get("cognition") or []):
+                npc_patch.setdefault(npc_id, {})["cognition"] = _updated_cog
+
     if surrender_items and ok and weakness_trigger:
         _held_names = {p.get("name") for p in props if p.get("name") and p.get("holder") == name}
         _valid_surrender = [x for x in surrender_items if x in _held_names]
         if _valid_surrender:
             out.setdefault("item_transfers", [])
             for _si in _valid_surrender:
-                out["item_transfers"].append({"item": _si, "from": npc_id, "auto_open": True})
+                out["item_transfers"].append({"item": _si, "from": npc_id})
             sys_msgs.append(f"【系统】{name}主动交出了「{'、'.join(_valid_surrender)}」。")
 
     if move_target and not move_blocked and ok and consent:
         npc_patch[npc_id]["location"] = move_target
+        npc_patch[npc_id]["current_intent"] = None  # 指令已执行完毕，清空意图，防 arbiter_node 二次执行（"悄悄去了"重复）
         if move_target not in (state.get("opened_scenes") or []):
             out["opened_scenes"] = [move_target]
         sys_msgs.append(f"【系统】{name}去了{move_target}。")
-        ui_events.append({"type": "npc_move", "npc": name, "target_scene": move_target})  # 2D frontend
+        ui_events.append({"type": "npc_move", "npc": name, "target_scene": move_target, "from_scene": scene})  # 2D frontend
     elif move_blocked:
+        npc_patch[npc_id]["current_intent"] = None  # 玩家指令已尝试失败，清空意图，防 arbiter_node 二次偷偷执行
         sys_msgs.append(f"【系统】{name}无法前往该场景（缺少凭证）。")
         ui_events.append({"type": "action_feedback", "target": name, "action": "threatened", "shake_screen": True})  # 2D frontend
 
@@ -772,15 +787,7 @@ async def npc_worker(state: AgentState, config: RunnableConfig) -> dict:
                 it in attire_values or any(it in str(val) for val in attire_values)
             ):
                 continue
-            # 子物品穿透拦截：锁住的容器内的子物品不能直接转移
-            _parent_box = None
-            for _cp in props:
-                if any(str(_c.get("name", "")).strip() == it for _c in (_parse_content(_cp.get("content")) or [])):
-                    _parent_box = _cp
-                    break
-            if _parent_box is not None and _parent_box.get("locked"):
-                sys_msgs.append(f"【系统】「{it}」锁在「{_parent_box.get('name')}」里，需要先拿到并打开宝盒。")
-                continue
+            # （物品已平铺，无容器子物品，无需穿透拦截）
             if it not in consented_set:
                 continue
             tp = next((p for p in props if p.get("name") == it), None)
@@ -789,19 +796,17 @@ async def npc_worker(state: AgentState, config: RunnableConfig) -> dict:
                 continue
             locked = bool(tp and tp.get("locked"))
             if locked:
-                keys = split_keys(key_name_of(tp)) if tp else []
-                npc_owners = [key_owner_npc(k, props) for k in keys]
-                is_npc_cred = bool(keys) and any(o is not None for o in npc_owners)
-                if is_npc_cred:
+                _bh = bio_holder_of(tp) if tp else ""
+                if _bh == name:
+                    # 生物锁且 bio_holder 是本人：同意帮忙 → 用自己的生物凭证（身体特征）开生物部分
                     transfers.append({"item": it, "from": npc_id, "auto_open": True})
-                    sys_msgs.append(f"【系统】{name}用自己的凭证打开了{it}，里面的东西已放入背包。")
-                    ui_events.append({"type": "item_transfer", "item": it, "count": 1, "from_npc": name, "to_player": True})  # 2D frontend
+                    ui_events.append({"type": "item_transfer", "item": it, "count": 1, "from_npc": name, "to_player": True})
                 else:
                     transfers.append({"item": it, "from": npc_id})
-                    ui_events.append({"type": "item_transfer", "item": it, "count": 1, "from_npc": name, "to_player": True})  # 2D frontend
+                    ui_events.append({"type": "item_transfer", "item": it, "count": 1, "from_npc": name, "to_player": True})
             else:
                 transfers.append({"item": it, "from": npc_id})
-                ui_events.append({"type": "item_transfer", "item": it, "count": 1, "from_npc": name, "to_player": True})  # 2D frontend
+                ui_events.append({"type": "item_transfer", "item": it, "count": 1, "from_npc": name, "to_player": True})
         if missing_items:
             sys_msgs.append(f"【系统】{name}身上似乎没有「{'、'.join(missing_items)}】。")
         for tr in transfers:
@@ -822,7 +827,17 @@ async def npc_worker(state: AgentState, config: RunnableConfig) -> dict:
             for _ax in accepted_from_player:
                 ui_events.append({"type": "item_transfer", "item": _ax, "count": 1, "from_player": True, "to_npc": name})  # 2D frontend
         else:
-            sys_msgs.append(f"【系统】{name}没有收下「{'、'.join(offered_items)}」，但 TA 已经看到了。")
+            _pl = state.get("player_items") or []
+            _bio_rej = [
+                x for x in offered_items
+                for _it in _pl
+                if isinstance(_it, dict) and _it.get("name") == x and _it.get("locked")
+                and str(_it.get("bio_holder", "") or "").strip() == name
+            ]
+            if _bio_rej:
+                sys_msgs.append(f"【系统】{name}拒绝帮你打开「{'、'.join(_bio_rej)}」，物品原样留在你的背包。")
+            else:
+                sys_msgs.append(f"【系统】{name}没有收下「{'、'.join(offered_items)}」，但 TA 已经看到了。")
             _mem_action = f"（{name}拒绝了玩家给的{'、'.join(offered_items)}，但已经看到了）"
         if _mem_action:
             _cur_mem = npc_patch.get(npc_id, {}).get("memory", {}) or {}
@@ -834,9 +849,6 @@ async def npc_worker(state: AgentState, config: RunnableConfig) -> dict:
             npc_patch.setdefault(npc_id, {})["memory"] = {"l1": _cur_l1}
     if aff_change <= -15:
         ui_events.append({"type": "action_feedback", "target": name, "action": "angry", "shake_screen": True})  # 2D frontend
-
-    # 无论有没有选项，都发事件给前端，没有就发空列表用于清屏
-    ui_events.append({"type": "show_options", "options": options if options else []})
 
     if sys_msgs:
         existing = {e.get("content") for e in (out.get("history") or []) if isinstance(e, dict)}
